@@ -3,6 +3,8 @@ param acrName string = 'myacr${uniqueString(resourceGroup().id)}'
 param storageName string = toLower('st${uniqueString(resourceGroup().id)}')
 param logWorkspaceName string = 'log-${uniqueString(resourceGroup().id)}'
 param appInsightsName string = 'appi-${uniqueString(resourceGroup().id)}'
+param githubOwner string = 'brantpastore'
+param githubRepo string = 'SiphonBot-Azure'
 
 resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
   name: acrName
@@ -214,3 +216,88 @@ resource storageRoleAssignment 'Microsoft.Authorization/roleAssignments@2020-10-
   }
   scope: storage
 }
+
+// Deployment script: create AAD app registration, service principal, federated credential,
+// create a client secret for fallback, store appId and secret in Key Vault, and assign roles.
+resource aadProvision 'Microsoft.Resources/deploymentScripts@2020-10-01' = {
+  name: 'provision-aad-app-${uniqueString(resourceGroup().id)}'
+  location: location
+  kind: 'AzureCLI'
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${uai.id}': {}
+    }
+  }
+  properties: {
+    azCliVersion: '2.59.0'
+    scriptContent: '''
+set -euo pipefail
+APP_NAME="siphonbot-github-actions-${uniqueString(resourceGroup().id)}"
+APP_FILTER="displayName eq '$APP_NAME'"
+
+# find or create app
+EXISTING_APP_ID=$(az ad app list --filter "$APP_FILTER" --query "[0].appId" -o tsv)
+if [ -z "$EXISTING_APP_ID" ]; then
+  APP_JSON=$(az ad app create --display-name "$APP_NAME" --identifier-uris "api://$APP_NAME" -o json)
+  APP_ID=$(echo "$APP_JSON" | jq -r .appId)
+  APP_OBJECT_ID=$(echo "$APP_JSON" | jq -r .id)
+else
+  APP_ID="$EXISTING_APP_ID"
+  APP_OBJECT_ID=$(az ad app show --id "$APP_ID" --query id -o tsv)
+fi
+
+# ensure service principal exists
+SP_OBJECT_ID=$(az ad sp list --filter "appId eq '$APP_ID'" --query "[0].id" -o tsv)
+if [ -z "$SP_OBJECT_ID" ]; then
+  az ad sp create --id "$APP_ID"
+  SP_OBJECT_ID=$(az ad sp list --filter "appId eq '$APP_ID'" --query "[0].id" -o tsv)
+fi
+
+# create federated identity credential for GitHub Actions (issuer + subject)
+FIC_PAYLOAD=$(jq -n --arg name "github-actions-fic" --arg issuer "https://token.actions.githubusercontent.com" --arg subject "repo:${GITHUB_OWNER}/${GITHUB_REPO}:ref:refs/heads/main" '{name:$name, issuer:$issuer, subject:$subject, description:"GitHub Actions OIDC"}')
+az rest --method POST --uri "https://graph.microsoft.com/v1.0/applications/$APP_OBJECT_ID/federatedIdentityCredentials" --body "$FIC_PAYLOAD" || true
+
+# create client secret for fallback and store both appId and secret in Key Vault
+SECRET_NAME_CLIENT="siphonbot-ci-client-secret"
+SECRET_NAME_APPID="siphonbot-ci-app-id"
+CLIENT_SECRET=$(az ad app credential reset --id "$APP_ID" --append --years 2 --query password -o tsv)
+az keyvault secret set --vault-name "${keyVault.name}" --name "$SECRET_NAME_CLIENT" --value "$CLIENT_SECRET" >/dev/null
+az keyvault secret set --vault-name "${keyVault.name}" --name "$SECRET_NAME_APPID" --value "$APP_ID" >/dev/null
+
+# assign roles: AcrPush on ACR and Contributor on the resourceGroup
+ACR_SCOPE="${acr.id}"
+RG_SCOPE="/subscriptions/${subscription().subscriptionId}/resourceGroups/${resourceGroup().name}"
+az role assignment create --assignee-object-id "$SP_OBJECT_ID" --assignee-principal-type ServicePrincipal --role "AcrPush" --scope "$ACR_SCOPE" || true
+az role assignment create --assignee-object-id "$SP_OBJECT_ID" --assignee-principal-type ServicePrincipal --role "Contributor" --scope "$RG_SCOPE" || true
+
+echo "PROVISIONED_APP_ID=$APP_ID"
+echo "PROVISIONED_SP_OBJECT_ID=$SP_OBJECT_ID"
+'''
+    supportingScriptUris: []
+    timeout: 'PT30M'
+    cleanupPreference: 'OnSuccess'
+    retentionInterval: 'P1D'
+    environmentVariables: [
+      {
+        name: 'GITHUB_OWNER'
+        value: githubOwner
+      }
+      {
+        name: 'GITHUB_REPO'
+        value: githubRepo
+      }
+    ]
+  }
+  dependsOn: [
+    keyVault
+    acr
+  ]
+}
+
+// Expose Key Vault secret URIs for the appId and client secret
+var clientSecretName = 'siphonbot-ci-client-secret'
+var appIdSecretName = 'siphonbot-ci-app-id'
+
+output ciClientSecretUri string = 'https://${keyVault.name}.vault.azure.net/secrets/${clientSecretName}'
+output ciAppIdSecretUri string = 'https://${keyVault.name}.vault.azure.net/secrets/${appIdSecretName}'

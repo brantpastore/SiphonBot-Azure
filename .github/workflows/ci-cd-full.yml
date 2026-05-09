@@ -28,54 +28,24 @@ jobs:
         run: |
           echo "No tests configured; add pytest or flake8 to run tests"
 
-  deploy-infra:
-    runs-on: ubuntu-latest
-    outputs:
-      acr_name: ${{ steps.set_acr.outputs.acr_name }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Login to Azure (OIDC)
-        uses: azure/login@v1
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID || '' }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID || '' }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID || '' }}
-          auth-type: service_principal
-          creds: ${{ secrets.AZURE_CREDENTIALS || '' }}
-
-      - name: Deploy infra (Bicep)
-        id: deploy
-        run: |
-          az deployment group create \
-            --resource-group ${{ secrets.RESOURCE_GROUP }} \
-            --template-file Azurify/infra/main.bicep \
-            --parameters acrName=${{ secrets.ACR_NAME || 'siphonbotacr' }}
-
-      - name: Set ACR output
-        id: set_acr
-        run: |
-          deployName=$(az deployment group list -g ${{ secrets.RESOURCE_GROUP }} --query "[0].name" -o tsv)
-          ACR_NAME=$(az deployment group show -g ${{ secrets.RESOURCE_GROUP }} --name $deployName --query properties.outputs.acrName.value -o tsv || true)
-          echo "acr_name=$ACR_NAME" >> $GITHUB_OUTPUT
+  # infra provisioning is handled outside the CI pipeline. This workflow
+  # only builds/pushes the container image and updates existing app resources.
 
 
   build-and-push:
     runs-on: ubuntu-latest
-    needs: [lint-test, deploy-infra]
+    needs: [lint-test]
     steps:
       - uses: actions/checkout@v4
       - name: Login to Azure (prefer OIDC if configured)
         uses: azure/login@v1
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID || '' }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID || '' }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID || '' }}
           auth-type: service_principal
-          creds: ${{ secrets.AZURE_CREDENTIALS || '' }}
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Set env from infra
+      - name: Set env from secrets
         run: |
-          echo "ACR_NAME=${{ needs.deploy-infra.outputs.acr_name }}" >> $GITHUB_ENV
+          echo "ACR_NAME=${{ secrets.ACR_NAME }}" >> $GITHUB_ENV
           echo "RESOURCE_GROUP=${{ secrets.RESOURCE_GROUP }}" >> $GITHUB_ENV
           echo "CONTAINERAPP_NAME=${{ secrets.CONTAINERAPP_NAME }}" >> $GITHUB_ENV
           echo "IMAGE_NAME=${{ secrets.IMAGE_NAME }}" >> $GITHUB_ENV
@@ -102,47 +72,16 @@ jobs:
       - name: Login to Azure (prefer OIDC if configured)
         uses: azure/login@v1
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID || '' }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID || '' }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID || '' }}
           auth-type: service_principal
-          creds: ${{ secrets.AZURE_CREDENTIALS || '' }}
-
-      - name: Deploy infra (Bicep)
-        id: deploy_bicep
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Load infra names from secrets
         run: |
-          az deployment group create \
-            --resource-group ${{ secrets.RESOURCE_GROUP }} \
-            --template-file Azurify/infra/main.bicep \
-            --parameters acrName=${{ needs.deploy-infra.outputs.acr_name || secrets.ACR_NAME }}
-
-      - name: Get infra outputs
-        id: get_infra_outputs
-        run: |
-          deployName=$(az deployment group list -g ${{ secrets.RESOURCE_GROUP }} --query "[0].name" -o tsv)
-          ACR_NAME=$(az deployment group show -g ${{ secrets.RESOURCE_GROUP }} --name $deployName --query properties.outputs.acrName.value -o tsv || true)
-          echo "ACR_NAME=$ACR_NAME" >> $GITHUB_ENV
-
-      - name: Get container apps environment id
-        id: get_env
-        run: |
-          envId=$(az deployment group show -g ${{ secrets.RESOURCE_GROUP }} --name $(az deployment group list -g ${{ secrets.RESOURCE_GROUP }} --query "[0].name" -o tsv) --query properties.outputs.containerAppsEnvironmentId.value -o tsv || true)
-          echo "CONTAINERAPPS_ENV_ID=$envId" >> $GITHUB_ENV
-
-      - name: Get user-assigned identity id
-        id: get_uai
-        run: |
-          uai=$(az deployment group show -g ${{ secrets.RESOURCE_GROUP }} --name $(az deployment group list -g ${{ secrets.RESOURCE_GROUP }} --query "[0].name" -o tsv) --query properties.outputs.userAssignedIdentityId.value -o tsv || true)
-          echo "USER_ASSIGNED_IDENTITY_ID=$uai" >> $GITHUB_ENV
-
-      - name: Get function app and key vault names from deployment outputs
-        id: get_outputs
-        run: |
-          deployName=$(az deployment group list -g ${{ secrets.RESOURCE_GROUP }} --query "[0].name" -o tsv)
-          KEYVAULT_NAME=$(az deployment group show -g ${{ secrets.RESOURCE_GROUP }} --name $deployName --query properties.outputs.keyVaultNameOutput.value -o tsv || true)
-          FUNCTION_NAME=$(az deployment group show -g ${{ secrets.RESOURCE_GROUP }} --name $deployName --query properties.outputs.functionAppName.value -o tsv || true)
-          echo "KEYVAULT_NAME=$KEYVAULT_NAME" >> $GITHUB_ENV
-          echo "FUNCTION_NAME=$FUNCTION_NAME" >> $GITHUB_ENV
+          echo "ACR_NAME=${{ secrets.ACR_NAME }}" >> $GITHUB_ENV
+          echo "RESOURCE_GROUP=${{ secrets.RESOURCE_GROUP }}" >> $GITHUB_ENV
+          echo "CONTAINERAPPS_ENV_ID=${{ secrets.CONTAINERAPPS_ENV_ID || '' }}" >> $GITHUB_ENV
+          echo "USER_ASSIGNED_IDENTITY_ID=${{ secrets.USER_ASSIGNED_IDENTITY_ID || '' }}" >> $GITHUB_ENV
+          echo "KEYVAULT_NAME=${{ secrets.KEYVAULT_NAME || '' }}" >> $GITHUB_ENV
+          echo "FUNCTION_NAME=${{ secrets.FUNCTION_NAME || '' }}" >> $GITHUB_ENV
 
       - name: Expose function keyvault secrets to env
         run: |
