@@ -35,20 +35,32 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     needs: [lint-test]
+    outputs:
+      full_image: ${{ steps.set_image.outputs.full_image }}
     steps:
       - uses: actions/checkout@v4
+      - name: Set image tag
+        run: echo "IMAGE_TAG=${GITHUB_SHA::8}" >> $GITHUB_ENV
       - name: Login to Azure (prefer OIDC if configured)
         uses: azure/login@v1
         with:
           auth-type: service_principal
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Debug Azure login
+        run: |
+          echo "--- az account show ---"
+          az account show || true
+          echo "--- az acr list (first 5) ---"
+          az acr list -o table || true
 
       - name: Set env from secrets
         run: |
-          echo "ACR_NAME=${{ secrets.ACR_NAME }}" >> $GITHUB_ENV
-          echo "RESOURCE_GROUP=${{ secrets.RESOURCE_GROUP }}" >> $GITHUB_ENV
-          echo "CONTAINERAPP_NAME=${{ secrets.CONTAINERAPP_NAME }}" >> $GITHUB_ENV
-          echo "IMAGE_NAME=${{ secrets.IMAGE_NAME }}" >> $GITHUB_ENV
+          # Prefer repository variables (`vars`) for non-sensitive identifiers,
+          # fall back to secrets if the var is not present.
+          echo "ACR_NAME=${{ vars.ACR_NAME }}" >> $GITHUB_ENV
+          echo "RESOURCE_GROUP=${{ vars.RESOURCE_GROUP }}" >> $GITHUB_ENV
+          echo "CONTAINERAPP_NAME=${{ vars.CONTAINERAPP_NAME }}" >> $GITHUB_ENV
+          echo "IMAGE_NAME=${{ vars.IMAGE_NAME }}" >> $GITHUB_ENV
 
       - name: Login to ACR
         run: az acr login --name $ACR_NAME
@@ -64,9 +76,23 @@ jobs:
           echo "ACR_LOGIN_SERVER=$(az acr show -n $ACR_NAME --query loginServer -o tsv)" >> $GITHUB_ENV
           echo "FULL_IMAGE=$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG" >> $GITHUB_ENV
 
+      - name: Set job output full_image
+        id: set_image
+        run: |
+          ACR_LOGIN_SERVER=$(az acr show -n $ACR_NAME --query loginServer -o tsv)
+          echo "full_image=$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
   deploy:
     runs-on: ubuntu-latest
     needs: build-and-push
+    env:
+      ACR_NAME: ${{ vars.ACR_NAME }}
+      RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+      IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+      CONTAINERAPP_NAME: ${{ vars.CONTAINERAPP_NAME }}
+      FUNCTION_NAME: ${{ vars.FUNCTION_NAME }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
     steps:
       - uses: actions/checkout@v4
       - name: Login to Azure (prefer OIDC if configured)
@@ -76,12 +102,47 @@ jobs:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
       - name: Load infra names from secrets
         run: |
-          echo "ACR_NAME=${{ secrets.ACR_NAME }}" >> $GITHUB_ENV
-          echo "RESOURCE_GROUP=${{ secrets.RESOURCE_GROUP }}" >> $GITHUB_ENV
-          echo "CONTAINERAPPS_ENV_ID=${{ secrets.CONTAINERAPPS_ENV_ID || '' }}" >> $GITHUB_ENV
-          echo "USER_ASSIGNED_IDENTITY_ID=${{ secrets.USER_ASSIGNED_IDENTITY_ID || '' }}" >> $GITHUB_ENV
-          echo "KEYVAULT_NAME=${{ secrets.KEYVAULT_NAME || '' }}" >> $GITHUB_ENV
-          echo "FUNCTION_NAME=${{ secrets.FUNCTION_NAME || '' }}" >> $GITHUB_ENV
+          # Prefer repository variables for non-sensitive identifiers; fall back to secrets.
+          echo "ACR_NAME=${{ vars.ACR_NAME }}" >> $GITHUB_ENV
+          echo "RESOURCE_GROUP=${{ vars.RESOURCE_GROUP }}" >> $GITHUB_ENV
+          echo "CONTAINERAPPS_ENV_ID=${{ vars.CONTAINERAPPS_ENV_ID || secrets.CONTAINERAPPS_ENV_ID || '' }}" >> $GITHUB_ENV
+          echo "USER_ASSIGNED_IDENTITY_ID=${{ vars.USER_ASSIGNED_IDENTITY_ID || secrets.USER_ASSIGNED_IDENTITY_ID || '' }}" >> $GITHUB_ENV
+          echo "KEYVAULT_NAME=${{ vars.KEYVAULT_NAME || secrets.KEYVAULT_NAME || '' }}" >> $GITHUB_ENV
+          echo "FUNCTION_NAME=${{ vars.FUNCTION_NAME }}" >> $GITHUB_ENV
+          echo "IMAGE_NAME=${{ vars.IMAGE_NAME }}" >> $GITHUB_ENV
+          echo "AZURE_TENANT_ID=${{ vars.AZURE_TENANT_ID }}" >> $GITHUB_ENV
+          echo "AZURE_SUBSCRIPTION_ID=${{ vars.AZURE_SUBSCRIPTION_ID }}" >> $GITHUB_ENV
+
+      - name: Recompute image tag and FULL_IMAGE and validate (with debug)
+        run: |
+          echo "IMAGE_TAG=${GITHUB_SHA::8}" >> $GITHUB_ENV
+          echo "DEBUG: IMAGE_NAME=${IMAGE_NAME}"
+          echo "IMAGE_TAG=$IMAGE_TAG"
+          echo "ACR_NAME=$ACR_NAME"
+          echo "IMAGE_NAME=$IMAGE_NAME"
+          ACR_LOGIN_SERVER=$(az acr show -n $ACR_NAME --query loginServer -o tsv || true)
+          echo "ACR_LOGIN_SERVER=$ACR_LOGIN_SERVER"
+          echo "Looking for tag $IMAGE_TAG in $IMAGE_NAME..."
+          az acr repository show-tags -n $ACR_NAME --repository $IMAGE_NAME -o tsv || true
+          # construct FULL_IMAGE and verify manifest exists
+          FULL_IMAGE="$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG"
+          echo "FULL_IMAGE_CANDIDATE=$FULL_IMAGE"
+          manifest=$(az acr repository show-manifests -n $ACR_NAME --repository $IMAGE_NAME --query "[?contains(tags, '$IMAGE_TAG')].digest | [0]" -o tsv 2>/dev/null || true)
+          if [ -n "$manifest" ]; then
+            echo "Found manifest $manifest for tag $IMAGE_TAG"
+            echo "FULL_IMAGE=$FULL_IMAGE" >> $GITHUB_ENV
+          else
+            echo "Tag $IMAGE_TAG not found for repository $IMAGE_NAME in ACR $ACR_NAME — attempting fallback to latest manifest digest"
+            fallback_digest=$(az acr repository show-manifests -n $ACR_NAME --repository $IMAGE_NAME --orderby time_desc --top 1 --query "[0].digest" -o tsv 2>/dev/null || true)
+            if [ -n "$fallback_digest" ]; then
+              echo "Found latest manifest $fallback_digest, using digest reference"
+              FULL_IMAGE="$ACR_LOGIN_SERVER/$IMAGE_NAME@$fallback_digest"
+              echo "FULL_IMAGE=$FULL_IMAGE" >> $GITHUB_ENV
+            else
+              echo "ERROR: no tag $IMAGE_TAG and no manifest found for repository $IMAGE_NAME in ACR $ACR_NAME"
+              exit 1
+            fi
+          fi
 
       - name: Expose function keyvault secrets to env
         run: |
@@ -89,38 +150,40 @@ jobs:
 
       - name: Create or update Container App
         run: |
-          FULL_IMAGE=${{ env.FULL_IMAGE }}
-          RG=${{ secrets.RESOURCE_GROUP }}
-          APP=${{ secrets.CONTAINERAPP_NAME }}
-          ENV_ID=${{ env.CONTAINERAPPS_ENV_ID }}
+          # Prefer runtime FULL_IMAGE (set earlier via GITHUB_ENV), otherwise use the build job output
+          FULL_IMAGE="${FULL_IMAGE:-${{ needs.build-and-push.outputs.full_image }}}"
+          RG="${RESOURCE_GROUP}"
+          APP="${CONTAINERAPP_NAME}"
+          ENV_ID="${CONTAINERAPPS_ENV_ID}"
+          echo "Using FULL_IMAGE=$FULL_IMAGE"
           if [ -z "$ENV_ID" ]; then echo "Container Apps environment ID not found. Ensure Bicep created the env."; exit 1; fi
 
           # If app exists, update image; otherwise create.
           exists=$(az containerapp show -g $RG -n $APP --query name -o tsv || true)
           if [ -n "$exists" ]; then
-            az containerapp update -g $RG -n $APP --image $FULL_IMAGE
+            az containerapp update -g $RG -n $APP --image "$FULL_IMAGE"
             # Assign the user-assigned identity so the container app can access Key Vault and ACR
-            if [ -n "${{ env.USER_ASSIGNED_IDENTITY_ID }}" ]; then
-              az containerapp identity assign -g $RG -n $APP --identities "${{ env.USER_ASSIGNED_IDENTITY_ID }}" || true
+            if [ -n "${USER_ASSIGNED_IDENTITY_ID:-}" ]; then
+              az containerapp identity assign -g $RG -n $APP --identities "$USER_ASSIGNED_IDENTITY_ID" || true
             fi
           else
-            if [ -n "${{ env.USER_ASSIGNED_IDENTITY_ID }}" ]; then
+            if [ -n "${USER_ASSIGNED_IDENTITY_ID:-}" ]; then
               az containerapp create \
-                --resource-group $RG \
-                --name $APP \
-                --environment $ENV_ID \
-                --image $FULL_IMAGE \
+                --resource-group "$RG" \
+                --name "$APP" \
+                --environment "$ENV_ID" \
+                --image "$FULL_IMAGE" \
                 --ingress 'external' \
                 --target-port 80 \
                 --min-replicas 0 \
                 --max-replicas 1 \
-                --assign-identity "${{ env.USER_ASSIGNED_IDENTITY_ID }}"
+                --assign-identity "$USER_ASSIGNED_IDENTITY_ID"
             else
               az containerapp create \
-                --resource-group $RG \
-                --name $APP \
-                --environment $ENV_ID \
-                --image $FULL_IMAGE \
+                --resource-group "$RG" \
+                --name "$APP" \
+                --environment "$ENV_ID" \
+                --image "$FULL_IMAGE" \
                 --ingress 'external' \
                 --target-port 80 \
                 --min-replicas 0 \
@@ -133,7 +196,7 @@ jobs:
         run: |
           IFS=',' read -ra SECRETS <<< "${FUNCTION_KEYVAULT_SECRETS}"
           KV=${{ env.KEYVAULT_NAME }}
-          RG=${{ secrets.RESOURCE_GROUP }}
+          RG=${{ env.RESOURCE_GROUP }}
           APP=${{ env.FUNCTION_NAME }}
           settings=()
           for s in "${SECRETS[@]}"; do
