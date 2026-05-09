@@ -142,6 +142,11 @@ jobs:
           echo "KEYVAULT_NAME=$KEYVAULT_NAME" >> $GITHUB_ENV
           echo "FUNCTION_NAME=$FUNCTION_NAME" >> $GITHUB_ENV
 
+      - name: Expose function keyvault secrets to env
+        if: ${{ secrets.FUNCTION_KEYVAULT_SECRETS != '' }}
+        run: |
+          echo "FUNCTION_KEYVAULT_SECRETS=${{ secrets.FUNCTION_KEYVAULT_SECRETS }}" >> $GITHUB_ENV
+
       - name: Create or update Container App
         run: |
           FULL_IMAGE=${{ env.FULL_IMAGE }}
@@ -184,7 +189,7 @@ jobs:
           fi
 
       - name: Configure Function App Key Vault references
-        if: env.FUNCTION_NAME != '' && secrets.FUNCTION_KEYVAULT_SECRETS != ''
+        if: env.FUNCTION_NAME != '' && env.FUNCTION_KEYVAULT_SECRETS != ''
         run: |
           IFS=',' read -ra SECRETS <<< "${{ secrets.FUNCTION_KEYVAULT_SECRETS }}"
           KV=${{ env.KEYVAULT_NAME }}
