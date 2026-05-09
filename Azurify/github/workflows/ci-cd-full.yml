@@ -1,0 +1,204 @@
+name: CI/CD - Build, push, deploy (full)
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install test deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+      - name: Run basic lint/tests
+        run: |
+          echo "No tests configured; add pytest or flake8 to run tests"
+
+  deploy-infra:
+    runs-on: ubuntu-latest
+    outputs:
+      acr_name: ${{ steps.set_acr.outputs.acr_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Login to Azure (OIDC)
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID || '' }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID || '' }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID || '' }}
+          enable-oidc: ${{ secrets.AZURE_CLIENT_ID && secrets.AZURE_TENANT_ID || false }}
+          creds: ${{ secrets.AZURE_CREDENTIALS || '' }}
+
+      - name: Deploy infra (Bicep)
+        id: deploy
+        run: |
+          az deployment group create \
+            --resource-group ${{ secrets.RESOURCE_GROUP }} \
+            --template-file Azurify/infra/main.bicep \
+            --parameters acrName=${{ secrets.ACR_NAME || 'siphonbotacr' }}
+
+      - name: Set ACR output
+        id: set_acr
+        run: |
+          deployName=$(az deployment group list -g ${{ secrets.RESOURCE_GROUP }} --query "[0].name" -o tsv)
+          ACR_NAME=$(az deployment group show -g ${{ secrets.RESOURCE_GROUP }} --name $deployName --query properties.outputs.acrName.value -o tsv || true)
+          echo "acr_name=$ACR_NAME" >> $GITHUB_OUTPUT
+
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: [lint-test, deploy-infra]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Login to Azure (prefer OIDC if configured)
+        uses: azure/login@v1
+        with:
+          # Prefer using federated credentials (OIDC) by providing client and tenant via secrets
+          # If not present, fallback to AZURE_CREDENTIALS service principal JSON
+          client-id: ${{ secrets.AZURE_CLIENT_ID || '' }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID || '' }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID || '' }}
+          enable-oidc: ${{ secrets.AZURE_CLIENT_ID && secrets.AZURE_TENANT_ID || false }}
+          creds: ${{ secrets.AZURE_CREDENTIALS || '' }}
+
+      - name: Set env from infra
+        run: |
+          echo "ACR_NAME=${{ needs.deploy-infra.outputs.acr_name }}" >> $GITHUB_ENV
+          echo "RESOURCE_GROUP=${{ secrets.RESOURCE_GROUP }}" >> $GITHUB_ENV
+          echo "CONTAINERAPP_NAME=${{ secrets.CONTAINERAPP_NAME }}" >> $GITHUB_ENV
+          echo "IMAGE_NAME=${{ secrets.IMAGE_NAME }}" >> $GITHUB_ENV
+
+      - name: Login to ACR
+        run: az acr login --name $ACR_NAME
+
+      - name: Build and push Docker image
+        run: |
+          ACR_LOGIN_SERVER=$(az acr show -n $ACR_NAME --query loginServer -o tsv)
+          docker build -t $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG .
+          docker push $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG
+
+      - name: Persist image info
+        run: |
+          echo "ACR_LOGIN_SERVER=$(az acr show -n $ACR_NAME --query loginServer -o tsv)" >> $GITHUB_ENV
+          echo "FULL_IMAGE=$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG" >> $GITHUB_ENV
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - uses: actions/checkout@v4
+      - name: Login to Azure (prefer OIDC if configured)
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID || '' }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID || '' }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID || '' }}
+          enable-oidc: ${{ secrets.AZURE_CLIENT_ID && secrets.AZURE_TENANT_ID || false }}
+          creds: ${{ secrets.AZURE_CREDENTIALS || '' }}
+
+      - name: Deploy infra (Bicep)
+        id: deploy_bicep
+        run: |
+          az deployment group create \
+            --resource-group ${{ secrets.RESOURCE_GROUP }} \
+            --template-file Azurify/infra/main.bicep \
+            --parameters acrName=${{ needs.deploy-infra.outputs.acr_name || secrets.ACR_NAME }}
+
+      - name: Get infra outputs
+        id: get_infra_outputs
+        run: |
+          deployName=$(az deployment group list -g ${{ secrets.RESOURCE_GROUP }} --query "[0].name" -o tsv)
+          ACR_NAME=$(az deployment group show -g ${{ secrets.RESOURCE_GROUP }} --name $deployName --query properties.outputs.acrName.value -o tsv || true)
+          echo "ACR_NAME=$ACR_NAME" >> $GITHUB_ENV
+
+      - name: Get container apps environment id
+        id: get_env
+        run: |
+          envId=$(az deployment group show -g ${{ secrets.RESOURCE_GROUP }} --name $(az deployment group list -g ${{ secrets.RESOURCE_GROUP }} --query "[0].name" -o tsv) --query properties.outputs.containerAppsEnvironmentId.value -o tsv || true)
+          echo "CONTAINERAPPS_ENV_ID=$envId" >> $GITHUB_ENV
+
+      - name: Get user-assigned identity id
+        id: get_uai
+        run: |
+          uai=$(az deployment group show -g ${{ secrets.RESOURCE_GROUP }} --name $(az deployment group list -g ${{ secrets.RESOURCE_GROUP }} --query "[0].name" -o tsv) --query properties.outputs.userAssignedIdentityId.value -o tsv || true)
+          echo "USER_ASSIGNED_IDENTITY_ID=$uai" >> $GITHUB_ENV
+
+      - name: Get function app and key vault names from deployment outputs
+        id: get_outputs
+        run: |
+          deployName=$(az deployment group list -g ${{ secrets.RESOURCE_GROUP }} --query "[0].name" -o tsv)
+          KEYVAULT_NAME=$(az deployment group show -g ${{ secrets.RESOURCE_GROUP }} --name $deployName --query properties.outputs.keyVaultNameOutput.value -o tsv || true)
+          FUNCTION_NAME=$(az deployment group show -g ${{ secrets.RESOURCE_GROUP }} --name $deployName --query properties.outputs.functionAppName.value -o tsv || true)
+          echo "KEYVAULT_NAME=$KEYVAULT_NAME" >> $GITHUB_ENV
+          echo "FUNCTION_NAME=$FUNCTION_NAME" >> $GITHUB_ENV
+
+      - name: Create or update Container App
+        run: |
+          FULL_IMAGE=${{ env.FULL_IMAGE }}
+          RG=${{ secrets.RESOURCE_GROUP }}
+          APP=${{ secrets.CONTAINERAPP_NAME }}
+          ENV_ID=${{ env.CONTAINERAPPS_ENV_ID }}
+          if [ -z "$ENV_ID" ]; then echo "Container Apps environment ID not found. Ensure Bicep created the env."; exit 1; fi
+
+          # If app exists, update image; otherwise create.
+          exists=$(az containerapp show -g $RG -n $APP --query name -o tsv || true)
+          if [ -n "$exists" ]; then
+            az containerapp update -g $RG -n $APP --image $FULL_IMAGE
+            # Assign the user-assigned identity so the container app can access Key Vault and ACR
+            if [ -n "${{ env.USER_ASSIGNED_IDENTITY_ID }}" ]; then
+              az containerapp identity assign -g $RG -n $APP --identities "${{ env.USER_ASSIGNED_IDENTITY_ID }}" || true
+            fi
+          else
+            if [ -n "${{ env.USER_ASSIGNED_IDENTITY_ID }}" ]; then
+              az containerapp create \
+                --resource-group $RG \
+                --name $APP \
+                --environment $ENV_ID \
+                --image $FULL_IMAGE \
+                --ingress 'external' \
+                --target-port 80 \
+                --min-replicas 0 \
+                --max-replicas 1 \
+                --assign-identity "${{ env.USER_ASSIGNED_IDENTITY_ID }}"
+            else
+              az containerapp create \
+                --resource-group $RG \
+                --name $APP \
+                --environment $ENV_ID \
+                --image $FULL_IMAGE \
+                --ingress 'external' \
+                --target-port 80 \
+                --min-replicas 0 \
+                --max-replicas 1
+            fi
+          fi
+
+      - name: Configure Function App Key Vault references
+        if: env.FUNCTION_NAME != '' && secrets.FUNCTION_KEYVAULT_SECRETS != ''
+        run: |
+          IFS=',' read -ra SECRETS <<< "${{ secrets.FUNCTION_KEYVAULT_SECRETS }}"
+          KV=${{ env.KEYVAULT_NAME }}
+          RG=${{ secrets.RESOURCE_GROUP }}
+          APP=${{ env.FUNCTION_NAME }}
+          settings=()
+          for s in "${SECRETS[@]}"; do
+            secretId=$(az keyvault secret show --vault-name "$KV" --name "$s" --query id -o tsv || true)
+            if [ -n "$secretId" ]; then
+              settings+=("$s=@Microsoft.KeyVault(SecretUri=${secretId})")
+            fi
+          done
+          if [ ${#settings[@]} -gt 0 ]; then
+            az functionapp config appsettings set --name "$APP" --resource-group "$RG" --settings "${settings[@]}"
+          else
+            echo "No secrets found or FUNCTION_KEYVAULT_SECRETS not configured."
+          fi

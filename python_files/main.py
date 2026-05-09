@@ -2,10 +2,21 @@ from env_config import load_env_variables
 from apis.reddit_api import RedditAuth
 from discord_bot import SiphonBot
 
+# Optional telemetry — import if available, otherwise provide no-op fallbacks
+try:
+    from Azurify.telemetry.app_insights_snippet import track_event, track_exception
+except Exception:
+    def track_event(*args, **kwargs):
+        return None
+
+    def track_exception(*args, **kwargs):
+        return None
+
 if __name__ == "__main__":
     env_vars = load_env_variables()
 
     print("Environment variables loaded successfully.")
+    track_event('startup', {"stage": "env_loaded"})
 
     reddit_auth = RedditAuth(
         env_vars["REDDIT_CLIENT_ID"],
