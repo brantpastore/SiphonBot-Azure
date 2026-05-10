@@ -664,14 +664,6 @@ jobs:
             echo "Container App runningStatus is '$RUNNING_STATUS' (no explicit start needed)."
           fi
 
-          # Force a restart of the latest revision so a newly deployed revision
-          # is actively re-evaluated even when app-level runningStatus is already Running.
-          LATEST_REVISION=$(az containerapp show -g "$RG" -n "$APP" --query properties.latestRevisionName -o tsv 2>/dev/null || true)
-          if [ -n "$LATEST_REVISION" ]; then
-            echo "Restarting latest revision: $LATEST_REVISION"
-            az containerapp revision restart -g "$RG" -n "$APP" --revision "$LATEST_REVISION" || true
-          fi
-
       - name: Health check Container App
         run: |
           RG="${RESOURCE_GROUP}"
@@ -684,6 +676,7 @@ jobs:
           # run has superseded it mid-health-check (race condition with minReplicas=0).
           DEPLOYED_REVISION=$(az containerapp show -g "$RG" -n "$APP" --query properties.latestRevisionName -o tsv 2>/dev/null || true)
           echo "Deployed revision for this run: $DEPLOYED_REVISION"
+          ACTIVATING_STREAK=0
 
           for i in $(seq 1 "$ATTEMPTS"); do
             PROVISIONING_STATE=$(az containerapp show -g "$RG" -n "$APP" --query properties.provisioningState -o tsv 2>/dev/null || true)
@@ -707,6 +700,19 @@ jobs:
 
             if [ "$PROVISIONING_STATE" = "Succeeded" ] && [ "$RUNNING_STATUS" = "Running" ] && [ "$REV_RUNNING_STATE" = "Running" ]; then
               echo "Container App health check passed (active revision: $CHECK_REVISION)."
+              exit 0
+            fi
+
+            if [ "$RUNNING_STATUS" = "Running" ] && [ "$REV_RUNNING_STATE" = "Activating" ] && [ "$REV_TRAFFIC" = "100" ] && [ "${REV_REPLICAS:-0}" -ge 1 ] && [ "$REV_HEALTH_STATE" != "Unhealthy" ]; then
+              ACTIVATING_STREAK=$((ACTIVATING_STREAK + 1))
+            else
+              ACTIVATING_STREAK=0
+            fi
+
+            # Discord bot worker revisions can stay in Activating while replicas are live;
+            # treat sustained healthy Activating state as success to avoid false negatives.
+            if [ "$ACTIVATING_STREAK" -ge 3 ]; then
+              echo "Container App health check passed (stable Activating state with live replicas)."
               exit 0
             fi
 
