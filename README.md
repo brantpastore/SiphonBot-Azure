@@ -83,6 +83,47 @@ docker compose up -d --build
 docker compose down && docker compose up -d --build && docker logs -f siphon_bot
 ```
 
+## Logging
+
+Log verbosity is controlled by the `LOG_LEVEL` environment variable (default: `INFO`).
+
+| Level   | Output                                                                                                          |
+| ------- | --------------------------------------------------------------------------------------------------------------- |
+| `INFO`  | Startup phases, secret source (Container App API vs env vars), HTTP status, present/missing key summary         |
+| `DEBUG` | All of the above plus each secret name → config key mapping (values masked as `abcd****`), per-key resolved status |
+
+### Azure Container Apps — change log level without redeploying
+
+```bash
+# Enable verbose debug logging
+az containerapp update \
+  -g siphon_bot \
+  -n siphonbot-app \
+  --set-env-vars LOG_LEVEL=DEBUG
+
+# Revert to normal
+az containerapp update \
+  -g siphon_bot \
+  -n siphonbot-app \
+  --set-env-vars LOG_LEVEL=INFO
+```
+
+Then tail logs:
+
+```bash
+az containerapp logs show -g siphon_bot -n siphonbot-app --follow
+```
+
+You can also set `LOG_LEVEL` in the Azure Portal under **Container Apps → siphonbot-app → Containers → Environment variables**.
+
+### Local / Docker
+
+Add `LOG_LEVEL=DEBUG` to your `.env` file, or pass it inline:
+
+```bash
+LOG_LEVEL=DEBUG docker compose up
+```
+
 ## Project structure
 
 ```
