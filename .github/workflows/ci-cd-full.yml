@@ -94,27 +94,40 @@ jobs:
 
       - name: Ensure Function runtime/app settings
         if: env.FUNCTION_NAME != ''
+        env:
+          STORAGE_CONN_STR: ${{ env.FUNCTION_STORAGE_CONNECTION_STRING || secrets.FUNCTION_STORAGE_CONNECTION_STRING }}
+          SB_CONN_STR: ${{ secrets.SERVICE_BUS_CONNECTION_STRING }}
         run: |
           RG=${{ env.RESOURCE_GROUP }}
           APP=${{ env.FUNCTION_NAME }}
           
-          # Use retrieved connection string, fallback to secret if not available
-          STORAGE_SETTING=""
-          if [ -n "${FUNCTION_STORAGE_CONNECTION_STRING}" ]; then
-            STORAGE_SETTING="AzureWebJobsStorage='${FUNCTION_STORAGE_CONNECTION_STRING}'"
-          elif [ -n "${{ secrets.FUNCTION_STORAGE_CONNECTION_STRING }}" ]; then
-            STORAGE_SETTING="AzureWebJobsStorage='${{ secrets.FUNCTION_STORAGE_CONNECTION_STRING }}'"
+          # Build settings array and set them all at once
+          # Only set storage if we have a connection string
+          if [ -n "$STORAGE_CONN_STR" ]; then
+            az functionapp config appsettings set \
+              --name "$APP" \
+              --resource-group "$RG" \
+              --settings \
+                AzureWebJobsStorage="$STORAGE_CONN_STR" \
+                SERVICE_BUS_CONNECTION_STRING="$SB_CONN_STR" \
+                FUNCTIONS_EXTENSION_VERSION=~4 \
+                FUNCTIONS_WORKER_RUNTIME=python \
+                WEBSITE_RUN_FROM_PACKAGE=1 \
+                SERVICE_BUS_QUEUE_NAME=siphon-queue
+            echo "✓ Function App settings configured with storage and Service Bus"
+          else
+            # If no storage, still set runtime settings
+            az functionapp config appsettings set \
+              --name "$APP" \
+              --resource-group "$RG" \
+              --settings \
+                SERVICE_BUS_CONNECTION_STRING="$SB_CONN_STR" \
+                FUNCTIONS_EXTENSION_VERSION=~4 \
+                FUNCTIONS_WORKER_RUNTIME=python \
+                WEBSITE_RUN_FROM_PACKAGE=1 \
+                SERVICE_BUS_QUEUE_NAME=siphon-queue
+            echo "⚠ Function App settings configured (no storage connection string)"
           fi
-          
-          az functionapp config appsettings set \
-            --name "$APP" \
-            --resource-group "$RG" \
-            --settings \
-              $STORAGE_SETTING \
-              FUNCTIONS_EXTENSION_VERSION='~4' \
-              FUNCTIONS_WORKER_RUNTIME=python \
-              WEBSITE_RUN_FROM_PACKAGE=1 \
-              SERVICE_BUS_QUEUE_NAME=siphon-queue
 
       - name: Deploy Azure Functions code
         if: env.FUNCTION_NAME != ''
