@@ -409,6 +409,14 @@ jobs:
           echo "Using REGISTRY_SERVER=$REGISTRY_SERVER"
           if [ -z "$ENV_ID" ]; then echo "Container Apps environment ID not found. Ensure Bicep created the env."; exit 1; fi
 
+          UAI_CLIENT_ID=""
+          if [ -n "${USER_ASSIGNED_IDENTITY_ID:-}" ]; then
+            UAI_CLIENT_ID=$(az identity show --ids "$USER_ASSIGNED_IDENTITY_ID" --query clientId -o tsv 2>/dev/null || true)
+            if [ -z "$UAI_CLIENT_ID" ]; then
+              echo "Warning: could not resolve user-assigned identity clientId."
+            fi
+          fi
+
           # If app exists but is in Failed provisioning state, delete it so we can recreate cleanly.
           APP_STATE=$(az containerapp show -g "$RG" -n "$APP" --query properties.provisioningState -o tsv 2>/dev/null || true)
           if [ "$APP_STATE" = "Failed" ]; then
@@ -439,6 +447,7 @@ jobs:
               siphonbot-service-bus-connection="${SERVICE_BUS_CONN}"
 
             az containerapp update -g $RG -n $APP --image "$FULL_IMAGE" \
+              --min-replicas 1 --max-replicas 1 \
               --set-env-vars \
                 REDDIT_CLIENT_ID="secretref:siphonbot-reddit-client-id" \
                 REDDIT_CLIENT_SECRET="secretref:siphonbot-reddit-client-secret" \
@@ -451,7 +460,9 @@ jobs:
                 SERVICE_BUS_QUEUE_NAME="siphon-queue" \
                 MEDIA_TMP_DIR="/tmp/siphon" \
                 AZURE_SUBSCRIPTION_ID="${AZURE_SUBSCRIPTION_ID}" \
-                AZURE_RESOURCE_GROUP="${RG}"
+                AZURE_RESOURCE_GROUP="${RG}" \
+                AZURE_CLIENT_ID="${UAI_CLIENT_ID}" \
+                DISCORD_SYNC_GLOBAL="false"
           else
             # Create container app via direct YAML file approach
             if [ -n "${USER_ASSIGNED_IDENTITY_ID:-}" ]; then
@@ -502,6 +513,10 @@ jobs:
                 echo "            value: $AZURE_SUBSCRIPTION_ID"
                 echo "          - name: AZURE_RESOURCE_GROUP"
                 echo "            value: $RG"
+                echo "          - name: AZURE_CLIENT_ID"
+                echo "            value: $UAI_CLIENT_ID"
+                echo "          - name: DISCORD_SYNC_GLOBAL"
+                echo "            value: false"
                 echo "        volumeMounts:"
                 echo "          - volumeName: ephemeral-downloads"
                 echo "            mountPath: /tmp/siphon"
@@ -509,7 +524,7 @@ jobs:
                 echo "      - name: ephemeral-downloads"
                 echo "        storageType: EmptyDir"
                 echo "    scale:"
-                echo "      minReplicas: 0"
+                echo "      minReplicas: 1"
                 echo "      maxReplicas: 1"
               } > /tmp/containerapp.yaml
               
@@ -572,6 +587,8 @@ jobs:
                 echo "            value: $AZURE_SUBSCRIPTION_ID"
                 echo "          - name: AZURE_RESOURCE_GROUP"
                 echo "            value: $RG"
+                echo "          - name: DISCORD_SYNC_GLOBAL"
+                echo "            value: false"
                 echo "        volumeMounts:"
                 echo "          - volumeName: ephemeral-downloads"
                 echo "            mountPath: /tmp/siphon"
@@ -579,7 +596,7 @@ jobs:
                 echo "      - name: ephemeral-downloads"
                 echo "        storageType: EmptyDir"
                 echo "    scale:"
-                echo "      minReplicas: 0"
+                echo "      minReplicas: 1"
                 echo "      maxReplicas: 1"
               } > /tmp/containerapp.yaml
               

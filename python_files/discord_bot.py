@@ -61,6 +61,13 @@ class SiphonBot:
     def set_cooldown(self, user_id: int):
         self.cooldowns[user_id] = time.time() + self.cooldown_seconds
 
+    @staticmethod
+    def _env_flag(name: str, default: bool) -> bool:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
     def setup_bot_commands(self):
         @self.tree.command(name="scrape", description="Scrape posts from a subreddit")
         async def scrape_command(
@@ -309,14 +316,28 @@ class SiphonBot:
     async def sync_commands(self):
         try:
             guild_id = os.environ.get("DISCORD_GUILD_ID", "").strip()
+            sync_global = self._env_flag("DISCORD_SYNC_GLOBAL", True)
+
             if guild_id.isdigit():
                 guild = discord.Object(id=int(guild_id))
-                self.tree.copy_global_to(guild=guild)
                 synced = await self.tree.sync(guild=guild)
                 print(f"Synced {len(synced)} guild command(s) to guild {guild_id}")
+            elif self.bot.guilds:
+                # Auto-detect guilds from the active bot session when no guild id is configured.
+                for g in self.bot.guilds:
+                    guild = discord.Object(id=g.id)
+                    synced = await self.tree.sync(guild=guild)
+                    print(f"Auto-synced {len(synced)} guild command(s) to guild {g.id} ({g.name})")
             else:
+                print("DISCORD_GUILD_ID not set and no guilds available yet; skipping guild sync.")
+
+            if sync_global:
                 synced = await self.tree.sync()
                 print(f"Synced {len(synced)} global command(s)")
+            elif not guild_id.isdigit() and not self.bot.guilds:
+                # Fallback so commands still get registered when guild cache is empty.
+                synced = await self.tree.sync()
+                print(f"Fallback: synced {len(synced)} global command(s)")
         except Exception as e:
             print(f"Failed to sync commands: {e}")
 

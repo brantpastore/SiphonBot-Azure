@@ -13,7 +13,7 @@ properties:
           cpu: 0.5
           memory: "1Gi"
     scale:
-      minReplicas: 0
+      minReplicas: 1
       maxReplicas: 1
 
 # This is a template — prefer deploying via the Bicep template or the CLI.
