@@ -466,10 +466,6 @@ jobs:
                 echo "    registries:"
                 echo "      - server: $REGISTRY_SERVER"
                 echo "        identity: $USER_ASSIGNED_IDENTITY_ID"
-                echo "    ingress:"
-                echo "      external: true"
-                echo "      targetPort: 80"
-                echo "      transport: Auto"
                 echo "  identity:"
                 echo "    type: UserAssigned"
                 echo "    userAssignedIdentities:"
@@ -544,10 +540,6 @@ jobs:
                 echo "    activeRevisionsMode: Single"
                 echo "    registries:"
                 echo "      - server: $REGISTRY_SERVER"
-                echo "    ingress:"
-                echo "      external: true"
-                echo "      targetPort: 80"
-                echo "      transport: Auto"
                 echo "  template:"
                 echo "    containers:"
                 echo "      - name: siphonbot-app"
@@ -608,6 +600,10 @@ jobs:
               rm -f /tmp/containerapp.yaml
             fi
           fi
+
+          # This app is a Discord worker, not an HTTP service. Disable ingress to
+          # prevent platform startup probes from probing port 80 and marking replicas unhealthy.
+          az containerapp ingress disable -g "$RG" -n "$APP" || true
 
       - name: Grant UAI Contributor role on Container App (enables listSecrets via Managed Identity)
         if: env.USER_ASSIGNED_IDENTITY_ID != ''
