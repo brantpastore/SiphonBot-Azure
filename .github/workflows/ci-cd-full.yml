@@ -671,8 +671,21 @@ jobs:
 
           RUNNING_STATUS=$(az containerapp show -g "$RG" -n "$APP" --query properties.runningStatus -o tsv 2>/dev/null || true)
           if [ "$RUNNING_STATUS" = "Stopped" ]; then
-            echo "Container App is stopped; starting now..."
-            az containerapp start -g "$RG" -n "$APP"
+            echo "Container App is stopped; attempting to start..."
+
+            if az containerapp start -h >/dev/null 2>&1; then
+              az containerapp start -g "$RG" -n "$APP" || true
+            else
+              echo "az containerapp start is unavailable in this runner CLI. Falling back to revision activate/restart."
+              LATEST_REVISION=$(az containerapp show -g "$RG" -n "$APP" --query properties.latestRevisionName -o tsv 2>/dev/null || true)
+              if [ -n "$LATEST_REVISION" ]; then
+                az containerapp revision activate -g "$RG" -n "$APP" --revision "$LATEST_REVISION" || true
+                az containerapp revision restart -g "$RG" -n "$APP" --revision "$LATEST_REVISION" || true
+              fi
+            fi
+
+            RUNNING_STATUS_AFTER=$(az containerapp show -g "$RG" -n "$APP" --query properties.runningStatus -o tsv 2>/dev/null || true)
+            echo "Container App runningStatus after start attempt: '$RUNNING_STATUS_AFTER'"
           else
             echo "Container App runningStatus is '$RUNNING_STATUS' (no explicit start needed)."
           fi
