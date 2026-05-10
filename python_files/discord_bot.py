@@ -320,12 +320,14 @@ class SiphonBot:
 
             if guild_id.isdigit():
                 guild = discord.Object(id=int(guild_id))
+                self.tree.copy_global_to(guild=guild)
                 synced = await self.tree.sync(guild=guild)
                 print(f"Synced {len(synced)} guild command(s) to guild {guild_id}")
             elif self.bot.guilds:
                 # Auto-detect guilds from the active bot session when no guild id is configured.
                 for g in self.bot.guilds:
                     guild = discord.Object(id=g.id)
+                    self.tree.copy_global_to(guild=guild)
                     synced = await self.tree.sync(guild=guild)
                     print(f"Auto-synced {len(synced)} guild command(s) to guild {g.id} ({g.name})")
             else:

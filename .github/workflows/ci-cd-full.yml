@@ -677,6 +677,12 @@ jobs:
             echo "Container App runningStatus is '$RUNNING_STATUS' (no explicit start needed)."
           fi
 
+      - name: Ensure ingress stays disabled for worker
+        run: |
+          RG="${RESOURCE_GROUP}"
+          APP="${CONTAINERAPP_NAME}"
+          az containerapp ingress disable -g "$RG" -n "$APP" || true
+
       - name: Health check Container App
         run: |
           RG="${RESOURCE_GROUP}"
