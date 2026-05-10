@@ -144,6 +144,13 @@ LOG_LEVEL=DEBUG docker compose up
     └── requirements.txt
 ```
 
+## Backlog
+
+- **Offload `/download` to the Function App** — `/scrape` commands already enqueue work to the Azure Service Bus queue for async processing by the Function App, but `/download` (YouTube / yt-dlp) still runs in-process inside the Container App. Offloading it would keep the bot responsive when multiple downloads are queued simultaneously. Blockers to address:
+  - The Function App (Consumption plan Linux) has no `ffmpeg` binary — it would need to be bundled as a self-contained executable or the plan switched to Premium/Dedicated.
+  - A new `download_video` job type must be added to `azure_functions/shared/media_processor.py`.
+  - The bot's `/download` handler must be wired to `queue_publisher.enqueue_download_job(...)` (analogous to the existing `enqueue_scrape_job`).
+
 ## Dependencies
 
 - [discord.py](https://discordpy.readthedocs.io/) - Discord bot framework
