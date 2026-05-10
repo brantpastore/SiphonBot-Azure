@@ -141,10 +141,32 @@ jobs:
           cp -R python_files function_package/python_files
           find function_package -name '*.Zone.Identifier' -delete
           (cd function_package && zip -r ../functionapp.zip .)
+
+          echo "=== Function App info ==="
+          az functionapp show -g "$RG" -n "$APP" \
+            --query "{state:state,kind:kind,sku:sku,linuxFxVersion:siteConfig.linuxFxVersion,runtimeVersion:siteConfig.pythonVersion}" \
+            -o json
+
+          echo "=== Current app settings (names only) ==="
+          az functionapp config appsettings list -g "$RG" -n "$APP" \
+            --query "[].name" -o json
+
+          echo "=== Zip contents ==="
+          unzip -l functionapp.zip
+
+          echo "=== Deploying zip ==="
           az functionapp deployment source config-zip \
             --resource-group "$RG" \
             --name "$APP" \
-            --src functionapp.zip
+            --src functionapp.zip \
+            --debug 2>&1 || {
+            EXIT=$?
+            echo "=== Deployment failed (exit $EXIT) — fetching Kudu deployment logs ==="
+            KUDU_URL="https://${APP}.scm.azurewebsites.net/api/deployments?$top=1"
+            TOKEN=$(az account get-access-token --resource https://management.azure.com --query accessToken -o tsv)
+            curl -sf -H "Authorization: Bearer $TOKEN" "$KUDU_URL" | python3 -m json.tool || true
+            exit $EXIT
+          }
 
 
   build-and-push:
