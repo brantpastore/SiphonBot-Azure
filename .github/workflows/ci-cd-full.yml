@@ -424,7 +424,9 @@ jobs:
                 WEBHOOK="secretref:siphonbot-discord-webhook" \
                 SERVICE_BUS_CONNECTION_STRING="secretref:siphonbot-service-bus-connection" \
                 SERVICE_BUS_QUEUE_NAME="siphon-queue" \
-                MEDIA_TMP_DIR="/tmp/siphon"
+                MEDIA_TMP_DIR="/tmp/siphon" \
+                AZURE_SUBSCRIPTION_ID="${AZURE_SUBSCRIPTION_ID}" \
+                AZURE_RESOURCE_GROUP="${RG}"
           else
             # Create container app via direct YAML file approach
             if [ -n "${USER_ASSIGNED_IDENTITY_ID:-}" ]; then
@@ -475,6 +477,10 @@ jobs:
                 echo "            value: siphon-queue"
                 echo "          - name: MEDIA_TMP_DIR"
                 echo "            value: /tmp/siphon"
+                echo "          - name: AZURE_SUBSCRIPTION_ID"
+                echo "            value: $AZURE_SUBSCRIPTION_ID"
+                echo "          - name: AZURE_RESOURCE_GROUP"
+                echo "            value: $RG"
                 echo "        volumeMounts:"
                 echo "          - volumeName: ephemeral-downloads"
                 echo "            mountPath: /tmp/siphon"
@@ -545,6 +551,10 @@ jobs:
                 echo "            value: siphon-queue"
                 echo "          - name: MEDIA_TMP_DIR"
                 echo "            value: /tmp/siphon"
+                echo "          - name: AZURE_SUBSCRIPTION_ID"
+                echo "            value: $AZURE_SUBSCRIPTION_ID"
+                echo "          - name: AZURE_RESOURCE_GROUP"
+                echo "            value: $RG"
                 echo "        volumeMounts:"
                 echo "          - volumeName: ephemeral-downloads"
                 echo "            mountPath: /tmp/siphon"
@@ -573,6 +583,36 @@ jobs:
               rm -f /tmp/containerapp.yaml
             fi
           fi
+
+      - name: Grant UAI Contributor role on Container App (enables listSecrets via Managed Identity)
+        if: env.USER_ASSIGNED_IDENTITY_ID != ''
+        run: |
+          RG="${RESOURCE_GROUP}"
+          APP="${CONTAINERAPP_NAME}"
+          UAI_ID="${USER_ASSIGNED_IDENTITY_ID}"
+
+          # Get the principal ID of the UAI
+          UAI_PRINCIPAL_ID=$(az resource show --ids "$UAI_ID" --query properties.principalId -o tsv 2>/dev/null || true)
+          if [ -z "$UAI_PRINCIPAL_ID" ]; then
+            echo "Could not resolve UAI principal ID; skipping role assignment."
+            exit 0
+          fi
+
+          # Get the Container App resource ID
+          APP_RESOURCE_ID=$(az containerapp show -g "$RG" -n "$APP" --query id -o tsv 2>/dev/null || true)
+          if [ -z "$APP_RESOURCE_ID" ]; then
+            echo "Container App not found; skipping role assignment."
+            exit 0
+          fi
+
+          # Assign Contributor on the Container App resource so the UAI can call listSecrets
+          az role assignment create \
+            --assignee-object-id "$UAI_PRINCIPAL_ID" \
+            --assignee-principal-type ServicePrincipal \
+            --role Contributor \
+            --scope "$APP_RESOURCE_ID" \
+            2>&1 | grep -v "already exists" || true
+          echo "✓ Contributor role ensured on Container App for UAI (enables Managed Identity listSecrets)"
 
   start-container-app:
     runs-on: ubuntu-latest

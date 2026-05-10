@@ -26,6 +26,12 @@ if __name__ == "__main__":
         env_vars["REDDIT_USER_AGENT"],
     )
 
-    bot = SiphonBot(env_vars["DISCORD_TOKEN"], env_vars["WEBHOOK"], reddit_auth)
+    bot = SiphonBot(
+        env_vars["DISCORD_TOKEN"],
+        env_vars["WEBHOOK"],
+        reddit_auth,
+        service_bus_connection=env_vars["SERVICE_BUS_CONNECTION_STRING"],
+        service_bus_queue=env_vars["SERVICE_BUS_QUEUE_NAME"],
+    )
 
     bot.run()

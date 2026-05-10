@@ -1,7 +1,6 @@
 import aiohttp
 import discord
 import time
-import os
 from discord import app_commands
 from apis.reddit_api import RedditAuth, check_subreddit_exists
 from apis.job_queue import JobQueuePublisher
@@ -15,10 +14,19 @@ NUM_POSTS = [1, 2, 3, 4, 5]
 
 
 class SiphonBot:
-    def __init__(self, token, webhook, reddit_auth: RedditAuth):
+    def __init__(
+        self,
+        token: str,
+        webhook: str,
+        reddit_auth: RedditAuth,
+        service_bus_connection: str = "",
+        service_bus_queue: str = "siphon-queue",
+    ):
         self.token = token
         self.webhook = webhook
         self.reddit_auth = reddit_auth
+        self.service_bus_connection = service_bus_connection
+        self.service_bus_queue = service_bus_queue
         self.bot = discord.Client(intents=discord.Intents.default())
         self.tree = app_commands.CommandTree(self.bot)
         self.subreddits = {
@@ -36,14 +44,12 @@ class SiphonBot:
         self.setup_bot_commands()
 
     def _build_queue_publisher(self):
-        connection = os.getenv("SERVICE_BUS_CONNECTION_STRING", "")
-        queue_name = os.getenv("SERVICE_BUS_QUEUE_NAME", "siphon-queue")
-        if not connection:
-            print("Hybrid mode disabled: SERVICE_BUS_CONNECTION_STRING not set. Using inline processing.")
+        if not self.service_bus_connection:
+            print("Hybrid mode disabled: no Service Bus connection string. Using inline processing.")
             return None
 
-        print(f"Hybrid mode enabled: queueing jobs to Service Bus queue '{queue_name}'.")
-        return JobQueuePublisher(connection, queue_name)
+        print(f"Hybrid mode enabled: queueing jobs to Service Bus queue '{self.service_bus_queue}'.")
+        return JobQueuePublisher(self.service_bus_connection, self.service_bus_queue)
 
     def check_cooldown(self, user_id: int) -> float:
         """Returns seconds remaining, or 0 if ready."""
