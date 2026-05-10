@@ -2,7 +2,11 @@ import aiohttp
 import discord
 import os
 import time
+import logging
+import traceback
 from discord import app_commands
+
+logger = logging.getLogger(__name__)
 from apis.reddit_api import RedditAuth, check_subreddit_exists
 from apis.job_queue import JobQueuePublisher
 from media.reddit_handler import RedditMediaHandler
@@ -243,7 +247,8 @@ class SiphonBot:
 
             # Reddit URLs (posts and v.redd.it) require authenticated API access;
             # route them through the reddit handler instead of yt-dlp.
-            if any(domain in url for domain in ("reddit.com", "redd.it", "v.redd.it")):
+            # Issue 31: Use proper hostname matching instead of substring search
+            if await self.reddit._domain_match(url, ["reddit.com", "redd.it", "v.redd.it"]):
                 await interaction.followup.send(f"Fetching Reddit media: {url}")
                 await self.reddit.fetch_and_send(interaction, url, upload_limit=upload_limit)
             else:
@@ -348,7 +353,7 @@ class SiphonBot:
                 synced = await self.tree.sync()
                 print(f"Fallback: synced {len(synced)} global command(s)")
         except Exception as e:
-            print(f"Failed to sync commands: {e}")
+            logger.exception(f"Failed to sync commands: {e}\n{traceback.format_exc()}")
 
     def run(self):
         @self.bot.event
@@ -370,6 +375,6 @@ class SiphonBot:
                         timeout=aiohttp.ClientTimeout(total=10),
                     )
             except Exception as e:
-                print(f"Error sending message to webhook: {e}")
+                logger.exception(f"Error sending message to webhook: {e}\n{traceback.format_exc()}")
 
         self.bot.run(self.token)

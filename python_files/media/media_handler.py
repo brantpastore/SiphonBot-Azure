@@ -4,10 +4,14 @@ import math
 import os
 import subprocess
 import time
+import logging
+import traceback
 import discord
 from discord.ui import View, Button
 
 import yt_dlp
+
+logger = logging.getLogger(__name__)
 
 from utils import sanitize_filename, is_safe_url
 from media.common import (
@@ -230,7 +234,7 @@ class MediaHandler:
                 try:
                     await self._download_hls_remux(hls_manifest, filepath)
                 except Exception as remux_err:
-                    print(f"HLS remux fast-path failed, falling back to yt-dlp: {remux_err}")
+                    logger.warning(f"HLS remux fast-path failed, falling back to yt-dlp: {remux_err}")
                     await self._download(url, filepath, upload_limit=upload_limit)
             else:
                 await self._download(url, filepath, upload_limit=upload_limit)
@@ -255,7 +259,7 @@ class MediaHandler:
             await send_file(interaction, title, filepath)
 
         except Exception as e:
-            print(f"YouTube download error: {e}")
+            logger.exception(f"YouTube download error: {e}\n{traceback.format_exc()}")
             await safe_followup(interaction, f"Error downloading video: {e}")
         finally:
             cleanup(workdir, filepath)
@@ -270,12 +274,26 @@ class MediaHandler:
             await safe_followup(
                 interaction, "Compressing video to fit under the limit..."
             )
-            await self._download(
-                url,
-                raw_path,
-                format_str="best[ext=mp4]/best",
-                upload_limit=upload_limit,
-            )
+            # Issue 18: Try HLS remux first to avoid re-encoding; fallback to download
+            hls_manifest = self._pick_hls_manifest(info)
+            if hls_manifest:
+                try:
+                    await self._download_hls_remux(hls_manifest, raw_path)
+                except Exception as remux_err:
+                    print(f"HLS remux in compress failed, falling back to yt-dlp: {remux_err}")
+                    await self._download(
+                        url,
+                        raw_path,
+                        format_str="best[ext=mp4]/best",
+                        upload_limit=upload_limit,
+                    )
+            else:
+                await self._download(
+                    url,
+                    raw_path,
+                    format_str="best[ext=mp4]/best",
+                    upload_limit=upload_limit,
+                )
 
             if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
                 await safe_followup(interaction, "Download failed.")
@@ -286,30 +304,34 @@ class MediaHandler:
                 await safe_followup(interaction, "Could not determine video duration.")
                 return
 
-            # Get source height to avoid upscaling
-            loop = asyncio.get_event_loop()
-            probe_cmd = [
-                "ffprobe",
-                "-v",
-                "quiet",
-                "-select_streams",
-                "v:0",
-                "-show_entries",
-                "stream=height",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                raw_path,
-            ]
-            probe_result = await loop.run_in_executor(
-                None,
-                lambda: subprocess.run(
-                    probe_cmd, capture_output=True, text=True, timeout=30
-                ),
-            )
-            try:
-                source_height = int(probe_result.stdout.strip())
-            except (ValueError, AttributeError):
-                source_height = 720
+            # Issue 20: Get source height from info metadata when available, avoiding redundant ffprobe
+            source_height = info.get("height")
+            if not source_height:
+                loop = asyncio.get_event_loop()
+                probe_cmd = [
+                    "ffprobe",
+                    "-v",
+                    "quiet",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=height",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    raw_path,
+                ]
+                probe_result = await loop.run_in_executor(
+                    None,
+                    lambda: subprocess.run(
+                        probe_cmd, capture_output=True, text=True, timeout=30
+                    ),
+                )
+                try:
+                    source_height = int(probe_result.stdout.strip())
+                except (ValueError, AttributeError):
+                    source_height = 720
+            else:
+                source_height = int(source_height)
 
             target_height = min(source_height, 480)
 
@@ -320,7 +342,8 @@ class MediaHandler:
             audio_kbps = 96
             video_kbps = max(target_total_kbps - audio_kbps, MIN_VIDEO_KBPS)
 
-            ffmpeg_cmd = ["ffmpeg", "-y", "-i", raw_path]
+            # Issue 19: Add ffmpeg flags for faster transcode and better Discord compatibility
+            ffmpeg_cmd = ["ffmpeg", "-y", "-i", raw_path, "-threads", "0"]
 
             if source_height > target_height:
                 ffmpeg_cmd += ["-vf", f"scale=-2:{target_height}"]
@@ -336,6 +359,10 @@ class MediaHandler:
                 f"{video_kbps}k",
                 "-preset",
                 "veryfast",
+                "-tune",
+                "fastdecode",
+                "-movflags",
+                "+faststart",
                 "-c:a",
                 "aac",
                 "-b:a",
@@ -361,7 +388,7 @@ class MediaHandler:
             await send_file(interaction, title, out_path)
 
         except Exception as e:
-            print(f"Compress error: {e}")
+            logger.exception(f"Compress error: {e}\n{traceback.format_exc()}")
             await safe_followup(interaction, f"Error compressing video: {e}")
         finally:
             cleanup(workdir, raw_path)
@@ -441,7 +468,7 @@ class MediaHandler:
                 await send_file(interaction, part_title, part_path)
 
         except Exception as e:
-            print(f"Split error: {e}")
+            logger.exception(f"Split error: {e}\n{traceback.format_exc()}")
             await safe_followup(interaction, f"Error splitting video: {e}")
         finally:
             for f in os.listdir(workdir):
@@ -513,7 +540,9 @@ class MediaHandler:
     MERGE_DOMAINS = ["youtube.com", "youtu.be"]
 
     async def _download(self, url, output_path, format_str=None, upload_limit=None):
-        limit_mb = (upload_limit or MAX_UPLOAD_BYTES) // (1024 * 1024) - 5
+        # Use consistent 1MB headroom (issue 17: was mixing 1MB vs 5MB)
+        limit_bytes = (upload_limit or MAX_UPLOAD_BYTES) - (1 * 1024 * 1024)
+        limit_mb = limit_bytes // (1024 * 1024)
         if format_str:
             fmt = format_str
         else:

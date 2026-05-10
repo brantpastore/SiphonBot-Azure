@@ -3,7 +3,11 @@ import asyncio
 import os
 import subprocess
 import re
+import logging
+import traceback
 from urllib.parse import urljoin, urlparse
+
+logger = logging.getLogger(__name__)
 
 from utils import sanitize_filename, is_safe_url
 from media.common import (
@@ -17,11 +21,17 @@ from media.common import (
 
 
 def should_skip(post_data):
+    """Check if post should be skipped based on metadata (issue 32)."""
     if post_data.get("stickied"):
         return True
     if post_data.get("pinned"):
         return True
     if post_data.get("removed_by_category"):
+        return True
+    # Skip posts where media/author was removed
+    if post_data.get("author") == "[deleted]":
+        return True
+    if post_data.get("is_self") and not post_data.get("selftext"):
         return True
     return False
 
@@ -35,6 +45,21 @@ class RedditMediaHandler:
 
     def _limit(self, upload_limit):
         return upload_limit or MAX_UPLOAD_BYTES
+
+    @staticmethod
+    async def _domain_match(url: str, domains: list[str]) -> bool:
+        """Check if URL hostname matches any domain (issue 31: proper parsing vs substring match)."""
+        try:
+            parsed = urlparse(url)
+            hostname = parsed.hostname or ""
+            hostname_lower = hostname.lower()
+            for domain in domains:
+                domain_lower = domain.lower()
+                if hostname_lower == domain_lower or hostname_lower.endswith("." + domain_lower):
+                    return True
+            return False
+        except Exception:
+            return False
 
     @staticmethod
     async def _download_to_file(session, url, output_path, timeout_seconds):
@@ -96,25 +121,34 @@ class RedditMediaHandler:
 
                 print(f"Fetched {len(posts)} posts, {len(filtered)} after filtering.")
 
-                for post in filtered:
-                    post_data = post.get("data", {})
-                    if post_data:
-                        print("Moving to get_post_content for:", post_data.get("url"))
-                        await self.get_post_content(
-                            post_data,
-                            interaction,
-                            upload_limit=upload_limit,
-                            session=session,
-                        )
+                # Issue 23: Parallelize post processing with semaphore to avoid overwhelming single vCPU
+                sem = asyncio.Semaphore(2)
+
+                async def process_post_with_sem(post):
+                    async with sem:
+                        post_data = post.get("data", {})
+                        if post_data:
+                            print("Moving to get_post_content for:", post_data.get("url"))
+                            await self.get_post_content(
+                                post_data,
+                                interaction,
+                                upload_limit=upload_limit,
+                                session=session,
+                            )
+
+                await asyncio.gather(
+                    *[process_post_with_sem(post) for post in filtered],
+                    return_exceptions=True
+                )
 
         except aiohttp.ClientResponseError as http_err:
-            print(f"HTTP error occurred: {http_err}")
+            logger.exception(f"HTTP error occurred: {http_err}\n{traceback.format_exc()}")
             await safe_followup(interaction, f"HTTP error occurred: {http_err}")
         except aiohttp.ClientError as e:
-            print(f"An error occurred: {e}")
+            logger.exception(f"An error occurred: {e}\n{traceback.format_exc()}")
             await safe_followup(interaction, f"An error occurred: {e}")
         except Exception as e:
-            print("Error encountered in scrape_subreddit:", e)
+            logger.exception(f"Error encountered in scrape_subreddit: {e}\n{traceback.format_exc()}")
             await safe_followup(interaction, f"An unexpected error occurred: {e}")
 
     async def get_post_content(self, post, interaction=None, upload_limit=None, session=None):
@@ -190,23 +224,21 @@ class RedditMediaHandler:
                     upload_limit=upload_limit,
                     session=session,
                 )
-            elif self.media_handler and any(
-                domain in url for domain in self.EXTERNAL_VIDEO_DOMAINS
-            ):
+            elif self.media_handler and await self._domain_match(url, self.EXTERNAL_VIDEO_DOMAINS):
                 if not is_safe_url(url):
                     await safe_followup(interaction, "URL is not safe to access.")
                     return
-                print(f"External video detected, routing to MediaHandler: {url}")
+                logger.info(f"External video detected, routing to MediaHandler: {url}")
                 await self.media_handler.download_and_send(interaction, url, upload_limit=upload_limit)
             else:
-                print("No image, video, gif, or gallery found.")
+                logger.info("No image, video, gif, or gallery found.")
                 await safe_followup(
                     interaction,
                     f"No image, video, gif, or gallery found for post: {title} ({url})",
                 )
 
         except Exception as e:
-            print("Error getting post content:", e)
+            logger.exception(f"Error getting post content: {e}\n{traceback.format_exc()}")
             await safe_followup(
                 interaction,
                 f"An unexpected error occurred while processing the post: {e}",
@@ -221,7 +253,7 @@ class RedditMediaHandler:
             print(f"Gallery post detected - sending preview link: {reddit_post_url}")
             await safe_followup(interaction, message)
         except Exception as e:
-            print("Error processing gallery content:", e)
+            logger.exception(f"Error processing gallery content: {e}\n{traceback.format_exc()}")
             await safe_followup(
                 interaction, f"Error processing gallery for {title}: {e}"
             )
@@ -416,13 +448,13 @@ class RedditMediaHandler:
             await send_file(interaction, content, video_filename)
 
         except subprocess.TimeoutExpired:
-            print("FFmpeg process timed out.")
+            logger.warning("FFmpeg process timed out.")
         except subprocess.CalledProcessError as e:
-            print(f"Error processing video with ffmpeg: {e}")
+            logger.error(f"Error processing video with ffmpeg: {e}\n{traceback.format_exc()}")
         except aiohttp.ClientError as e:
-            print(f"Error downloading video: {e}")
+            logger.error(f"Error downloading video: {e}\n{traceback.format_exc()}")
         except Exception as e:
-            print(f"Unexpected error in process_video: {e}")
+            logger.exception(f"Unexpected error in process_video: {e}\n{traceback.format_exc()}")
         finally:
             cleanup(workdir, video_filename)
 
@@ -565,5 +597,5 @@ class RedditMediaHandler:
                 )
 
         except Exception as e:
-            print(f"Error fetching Reddit post: {e}")
+            logger.exception(f"Error fetching Reddit post: {e}\n{traceback.format_exc()}")
             await safe_followup(interaction, f"Error fetching post: {e}")
