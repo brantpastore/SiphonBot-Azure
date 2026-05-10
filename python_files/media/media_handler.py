@@ -112,6 +112,12 @@ class MediaHandler:
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
+            # bgutil PO token provider for YouTube bot-check bypass (script mode)
+            "extractor_args": {
+                "youtubepot-bgutilscript": {
+                    "server_home": ["/opt/bgutil-ytdlp-pot-provider/server"]
+                }
+            },
         }
         cookie_file = os.getenv("YTDLP_COOKIES_FILE", "").strip()
         if cookie_file:
