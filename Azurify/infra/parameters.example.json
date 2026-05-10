@@ -23,6 +23,9 @@
     "functionStorageConnectionString": {
       "value": ""
     },
+    "serviceBusName": {
+      "value": "siphonbusopwgwe5r55ke6"
+    },
     "createUaiAcrPullAssignment": {
       "value": false
     },
@@ -31,4 +34,3 @@
     }
   }
 }
-

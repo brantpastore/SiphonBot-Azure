@@ -3,3 +3,4 @@ python-dotenv
 requests
 aiohttp
 yt-dlp
+azure-servicebus

@@ -10,7 +10,8 @@ MAX_UPLOAD_BYTES = int(os.getenv("DISCORD_MAX_UPLOAD_MB", "10")) * 1024 * 1024
 
 
 def make_workdir():
-    path = os.path.join(tempfile.gettempdir(), f"media_{uuid.uuid4().hex}")
+    base_tmp = os.getenv("MEDIA_TMP_DIR") or tempfile.gettempdir()
+    path = os.path.join(base_tmp, f"media_{uuid.uuid4().hex}")
     os.makedirs(path, exist_ok=True)
     return path
 

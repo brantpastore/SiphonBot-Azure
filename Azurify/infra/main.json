@@ -1,0 +1,276 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.43.8.12551",
+      "templateHash": "8063485870832635809"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]"
+    },
+    "acrName": {
+      "type": "string",
+      "defaultValue": "[format('myacr{0}', uniqueString(resourceGroup().id))]"
+    },
+    "logWorkspaceName": {
+      "type": "string",
+      "defaultValue": "[format('log-{0}', uniqueString(resourceGroup().id))]"
+    },
+    "appInsightsName": {
+      "type": "string",
+      "defaultValue": "[format('appi-{0}', uniqueString(resourceGroup().id))]"
+    },
+    "functionAppName": {
+      "type": "string",
+      "defaultValue": "[format('siphonbot-func-{0}', uniqueString(resourceGroup().id))]",
+      "metadata": {
+        "description": "Name for the optional Function App"
+      }
+    },
+    "deployFunctionApp": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Set true to deploy Function App resources. Requires functionStorageConnectionString."
+      }
+    },
+    "functionStorageConnectionString": {
+      "type": "securestring",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Existing Storage connection string for AzureWebJobsStorage (only used when deployFunctionApp=true)."
+      }
+    },
+    "serviceBusName": {
+      "type": "string",
+      "defaultValue": "[format('siphonbus{0}', uniqueString(resourceGroup().id))]"
+    },
+    "createUaiAcrPullAssignment": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Create AcrPull role assignment for user-assigned identity (disable if it already exists)."
+      }
+    },
+    "containerAppPrincipalId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Optional: principal id of an existing container app to grant AcrPull for (leave empty to skip)"
+      }
+    }
+  },
+  "variables": {
+    "acrPullRoleDef": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.ContainerRegistry/registries",
+      "apiVersion": "2023-07-01",
+      "name": "[parameters('acrName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Basic"
+      }
+    },
+    {
+      "type": "Microsoft.OperationalInsights/workspaces",
+      "apiVersion": "2021-06-01",
+      "name": "[parameters('logWorkspaceName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "sku": {
+          "name": "PerGB2018"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Insights/components",
+      "apiVersion": "2020-02-02",
+      "name": "[parameters('appInsightsName')]",
+      "location": "[parameters('location')]",
+      "kind": "web",
+      "properties": {
+        "Application_Type": "web",
+        "WorkspaceResourceId": "[resourceId('Microsoft.OperationalInsights/workspaces', parameters('logWorkspaceName'))]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.OperationalInsights/workspaces', parameters('logWorkspaceName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.App/managedEnvironments",
+      "apiVersion": "2023-05-01",
+      "name": "[format('containerapps-env-{0}', uniqueString(resourceGroup().id))]",
+      "location": "[parameters('location')]",
+      "properties": {}
+    },
+    {
+      "type": "Microsoft.ServiceBus/namespaces",
+      "apiVersion": "2021-11-01",
+      "name": "[parameters('serviceBusName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard",
+        "tier": "Standard"
+      }
+    },
+    {
+      "type": "Microsoft.ServiceBus/namespaces/queues",
+      "apiVersion": "2021-11-01",
+      "name": "[format('{0}/{1}', parameters('serviceBusName'), 'siphon-queue')]",
+      "properties": {
+        "enablePartitioning": false
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ServiceBus/namespaces', parameters('serviceBusName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "apiVersion": "2018-11-30",
+      "name": "[format('siphonbot-uai-{0}', uniqueString(resourceGroup().id))]",
+      "location": "[parameters('location')]"
+    },
+    {
+      "condition": "[parameters('deployFunctionApp')]",
+      "type": "Microsoft.Web/serverfarms",
+      "apiVersion": "2023-01-01",
+      "name": "[format('{0}-plan', parameters('functionAppName'))]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Y1",
+        "tier": "Dynamic"
+      },
+      "properties": {
+        "reserved": true
+      }
+    },
+    {
+      "condition": "[parameters('deployFunctionApp')]",
+      "type": "Microsoft.Web/sites",
+      "apiVersion": "2023-01-01",
+      "name": "[parameters('functionAppName')]",
+      "location": "[parameters('location')]",
+      "kind": "functionapp",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "properties": {
+        "serverFarmId": "[resourceId('Microsoft.Web/serverfarms', format('{0}-plan', parameters('functionAppName')))]",
+        "siteConfig": {
+          "linuxFxVersion": "PYTHON|3.11",
+          "appSettings": [
+            {
+              "name": "FUNCTIONS_WORKER_RUNTIME",
+              "value": "python"
+            },
+            {
+              "name": "WEBSITE_RUN_FROM_PACKAGE",
+              "value": "1"
+            },
+            {
+              "name": "SERVICE_BUS_QUEUE_NAME",
+              "value": "siphon-queue"
+            },
+            {
+              "name": "AzureWebJobsStorage",
+              "value": "[parameters('functionStorageConnectionString')]"
+            },
+            {
+              "name": "APPINSIGHTS_INSTRUMENTATIONKEY",
+              "value": "[reference(resourceId('Microsoft.Insights/components', parameters('appInsightsName')), '2020-02-02').InstrumentationKey]"
+            },
+            {
+              "name": "APPLICATIONINSIGHTS_CONNECTION_STRING",
+              "value": "[reference(resourceId('Microsoft.Insights/components', parameters('appInsightsName')), '2020-02-02').ConnectionString]"
+            }
+          ]
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Insights/components', parameters('appInsightsName'))]",
+        "[resourceId('Microsoft.Web/serverfarms', format('{0}-plan', parameters('functionAppName')))]",
+        "[resourceId('Microsoft.ServiceBus/namespaces/queues', parameters('serviceBusName'), 'siphon-queue')]"
+      ]
+    },
+    {
+      "condition": "[parameters('createUaiAcrPullAssignment')]",
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2020-10-01-preview",
+      "scope": "[resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName'))]",
+      "name": "[guid(resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('siphonbot-uai-{0}', uniqueString(resourceGroup().id))), 'acrPull')]",
+      "properties": {
+        "roleDefinitionId": "[variables('acrPullRoleDef')]",
+        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('siphonbot-uai-{0}', uniqueString(resourceGroup().id))), '2018-11-30').principalId]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName'))]",
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('siphonbot-uai-{0}', uniqueString(resourceGroup().id)))]"
+      ]
+    },
+    {
+      "condition": "[not(equals(parameters('containerAppPrincipalId'), ''))]",
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2020-10-01-preview",
+      "scope": "[resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName'))]",
+      "name": "[guid(resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName')), parameters('containerAppPrincipalId'), 'containerAppAcr')]",
+      "properties": {
+        "roleDefinitionId": "[variables('acrPullRoleDef')]",
+        "principalId": "[parameters('containerAppPrincipalId')]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName'))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "acrLoginServer": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName')), '2023-07-01').loginServer]"
+    },
+    "acrName": {
+      "type": "string",
+      "value": "[parameters('acrName')]"
+    },
+    "appInsightsId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Insights/components', parameters('appInsightsName'))]"
+    },
+    "containerAppsEnvironmentId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.App/managedEnvironments', format('containerapps-env-{0}', uniqueString(resourceGroup().id)))]"
+    },
+    "serviceBusNamespace": {
+      "type": "string",
+      "value": "[parameters('serviceBusName')]"
+    },
+    "serviceBusQueue": {
+      "type": "string",
+      "value": "siphon-queue"
+    },
+    "userAssignedIdentityId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('siphonbot-uai-{0}', uniqueString(resourceGroup().id)))]"
+    },
+    "userAssignedIdentityPrincipalId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('siphonbot-uai-{0}', uniqueString(resourceGroup().id))), '2018-11-30').principalId]"
+    },
+    "functionAppName": {
+      "type": "string",
+      "value": "[if(parameters('deployFunctionApp'), parameters('functionAppName'), '')]"
+    },
+    "functionPrincipalId": {
+      "type": "string",
+      "value": "[if(parameters('deployFunctionApp'), reference(resourceId('Microsoft.Web/sites', parameters('functionAppName')), '2023-01-01', 'full').identity.principalId, '')]"
+    }
+  }
+}

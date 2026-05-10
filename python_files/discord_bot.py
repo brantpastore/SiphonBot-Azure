@@ -1,8 +1,10 @@
 import aiohttp
 import discord
 import time
+import os
 from discord import app_commands
 from apis.reddit_api import RedditAuth, check_subreddit_exists
+from apis.job_queue import JobQueuePublisher
 from media.reddit_handler import RedditMediaHandler
 from media.media_handler import MediaHandler
 
@@ -30,7 +32,18 @@ class SiphonBot:
         self.reddit = RedditMediaHandler(self.reddit_auth, self.media)
         self.cooldowns: dict[int, float] = {}
         self.cooldown_seconds = 5
+        self.queue_publisher = self._build_queue_publisher()
         self.setup_bot_commands()
+
+    def _build_queue_publisher(self):
+        connection = os.getenv("SERVICE_BUS_CONNECTION_STRING", "")
+        queue_name = os.getenv("SERVICE_BUS_QUEUE_NAME", "siphon-queue")
+        if not connection:
+            print("Hybrid mode disabled: SERVICE_BUS_CONNECTION_STRING not set. Using inline processing.")
+            return None
+
+        print(f"Hybrid mode enabled: queueing jobs to Service Bus queue '{queue_name}'.")
+        return JobQueuePublisher(connection, queue_name)
 
     def check_cooldown(self, user_id: int) -> float:
         """Returns seconds remaining, or 0 if ready."""
@@ -66,15 +79,28 @@ class SiphonBot:
 
                 self.set_cooldown(interaction.user.id)
                 await interaction.response.defer()
-                await interaction.followup.send(
-                    f"Starting to scrape {num_posts} posts from: r/{subreddit_url}"
-                )
-                upload_limit = interaction.guild.filesize_limit if interaction.guild else None
-                print(f"Guild upload limit: {upload_limit} bytes")
-                await self.reddit.scrape_subreddit(
-                    interaction, subreddit_url, num_posts, filter_type, time_range,
-                    upload_limit=upload_limit
-                )
+                if self.queue_publisher:
+                    await self.queue_publisher.enqueue_scrape_job(
+                        subreddit=subreddit_url,
+                        filter_type=filter_type,
+                        num_posts=num_posts,
+                        time_range=time_range,
+                        webhook_url=self.webhook,
+                        requested_by=str(interaction.user.id),
+                    )
+                    await interaction.followup.send(
+                        f"Queued scrape job for r/{subreddit_url} ({num_posts} post(s), {filter_type})."
+                    )
+                else:
+                    await interaction.followup.send(
+                        f"Starting to scrape {num_posts} posts from: r/{subreddit_url}"
+                    )
+                    upload_limit = interaction.guild.filesize_limit if interaction.guild else None
+                    print(f"Guild upload limit: {upload_limit} bytes")
+                    await self.reddit.scrape_subreddit(
+                        interaction, subreddit_url, num_posts, filter_type, time_range,
+                        upload_limit=upload_limit
+                    )
             else:
                 await interaction.response.send_message(
                     "Invalid subreddit number. Please choose a number between 1 and 5."
@@ -127,12 +153,25 @@ class SiphonBot:
 
                 self.set_cooldown(interaction.user.id)
                 await interaction.response.defer()
-                await interaction.followup.send(
-                    f"Starting to scrape {num_posts} posts from: r/{subreddit_name}"
-                )
-                await self.reddit.scrape_subreddit(
-                    interaction, subreddit_name, num_posts, filter_type, time_range
-                )
+                if self.queue_publisher:
+                    await self.queue_publisher.enqueue_scrape_job(
+                        subreddit=subreddit_name,
+                        filter_type=filter_type,
+                        num_posts=num_posts,
+                        time_range=time_range,
+                        webhook_url=self.webhook,
+                        requested_by=str(interaction.user.id),
+                    )
+                    await interaction.followup.send(
+                        f"Queued scrape job for r/{subreddit_name} ({num_posts} post(s), {filter_type})."
+                    )
+                else:
+                    await interaction.followup.send(
+                        f"Starting to scrape {num_posts} posts from: r/{subreddit_name}"
+                    )
+                    await self.reddit.scrape_subreddit(
+                        interaction, subreddit_name, num_posts, filter_type, time_range
+                    )
             else:
                 await interaction.response.send_message(
                     "Invalid subreddit name. Community not found. Please provide a valid subreddit name."

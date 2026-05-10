@@ -1,28 +1,32 @@
 param location string = resourceGroup().location
 param acrName string = 'myacr${uniqueString(resourceGroup().id)}'
-param storageName string = toLower('st${uniqueString(resourceGroup().id)}')
 param logWorkspaceName string = 'log-${uniqueString(resourceGroup().id)}'
 param appInsightsName string = 'appi-${uniqueString(resourceGroup().id)}'
-param githubOwner string = 'brantpastore'
-param githubRepo string = 'SiphonBot-Azure'
+
+@description('Name for the optional Function App')
+param functionAppName string = 'siphonbot-func-${uniqueString(resourceGroup().id)}'
+
+@description('Set true to deploy Function App resources. Requires functionStorageConnectionString.')
+param deployFunctionApp bool = false
+
+@description('Existing Storage connection string for AzureWebJobsStorage (only used when deployFunctionApp=true).')
+@secure()
+param functionStorageConnectionString string = ''
+
+// Service Bus namespace and queue for decoupling
+param serviceBusName string = 'siphonbus${uniqueString(resourceGroup().id)}'
+
+@description('Create AcrPull role assignment for user-assigned identity (disable if it already exists).')
+param createUaiAcrPullAssignment bool = true
+
+@description('Optional: principal id of an existing container app to grant AcrPull for (leave empty to skip)')
+param containerAppPrincipalId string = ''
 
 resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
   name: acrName
   location: location
   sku: {
     name: 'Basic'
-  }
-}
-
-resource storage 'Microsoft.Storage/storageAccounts@2022-09-01' = {
-  name: storageName
-  location: location
-  sku: {
-    name: 'Standard_LRS'
-  }
-  kind: 'StorageV2'
-  properties: {
-    supportsHttpsTrafficOnly: true
   }
 }
 
@@ -44,79 +48,14 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
     Application_Type: 'web'
     WorkspaceResourceId: log.id
   }
-  dependsOn: [
-    log
-  ]
 }
 
-// Container Apps managed environment uses the Microsoft.App provider
-// (resource type: Microsoft.App/managedEnvironments). Use an API version
-// supported in this subscription and location.
 resource containerEnv 'Microsoft.App/managedEnvironments@2023-05-01' = {
   name: 'containerapps-env-${uniqueString(resourceGroup().id)}'
   location: location
   properties: {}
 }
 
-output acrLoginServer string = acr.properties.loginServer
-output acrName string = acr.name
-output storageAccountName string = storage.name
-output appInsightsId string = appInsights.id
-output containerAppsEnvironmentId string = containerEnv.id
-
-@description('Name for the Function App')
-param functionAppName string = 'siphonbot-func-${uniqueString(resourceGroup().id)}'
-
-// App Service plan for Functions (Consumption SKU Y1)
-resource functionPlan 'Microsoft.Web/serverfarms@2023-01-01' = {
-  name: '${functionAppName}-plan'
-  location: location
-  sku: {
-    name: 'Y1'
-    tier: 'Dynamic'
-  }
-  properties: {
-    reserved: true
-  }
-}
-
-// Function App with system-assigned identity
-resource functionApp 'Microsoft.Web/sites@2023-01-01' = {
-  name: functionAppName
-  location: location
-  kind: 'functionapp'
-  identity: {
-    type: 'SystemAssigned'
-  }
-  properties: {
-    serverFarmId: functionPlan.id
-    siteConfig: {
-      linuxFxVersion: 'PYTHON|3.11'
-      appSettings: [
-        {
-          name: 'FUNCTIONS_WORKER_RUNTIME'
-          value: 'python'
-        }
-        {
-          name: 'AzureWebJobsStorage'
-          value: 'DefaultEndpointsProtocol=https;AccountName=${storage.name};AccountKey=${storage.listKeys().keys[0].value};EndpointSuffix=core.windows.net'
-        }
-        {
-          name: 'APPINSIGHTS_INSTRUMENTATIONKEY'
-          value: appInsights.properties.InstrumentationKey
-        }
-        {
-          name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
-          value: appInsights.properties.ConnectionString
-        }
-      ]
-    }
-  }
-  // dependencies are implied by resource references (serverFarmId, storage, appInsights)
-}
-
-// Service Bus namespace and queue for decoupling
-param serviceBusName string = 'siphonbus${uniqueString(resourceGroup().id)}'
 resource sbNamespace 'Microsoft.ServiceBus/namespaces@2021-11-01' = {
   name: serviceBusName
   location: location
@@ -134,63 +73,70 @@ resource sbQueue 'Microsoft.ServiceBus/namespaces/queues@2021-11-01' = {
   }
 }
 
-// User-assigned managed identity for Container Apps and other resources
+// User-assigned managed identity for Container Apps image pull
 resource uai 'Microsoft.ManagedIdentity/userAssignedIdentities@2018-11-30' = {
   name: 'siphonbot-uai-${uniqueString(resourceGroup().id)}'
   location: location
 }
 
-// Key Vault to store secrets (will grant access to Function and UAI via access policies)
-param keyVaultName string = 'kv-${uniqueString(resourceGroup().id)}'
-resource keyVault 'Microsoft.KeyVault/vaults@2022-07-01' = {
-  name: keyVaultName
+// App Service plan and Function App are optional in this profile.
+resource functionPlan 'Microsoft.Web/serverfarms@2023-01-01' = if (deployFunctionApp) {
+  name: '${functionAppName}-plan'
   location: location
-  properties: {
-    sku: {
-      family: 'A'
-      name: 'standard'
-    }
-    tenantId: subscription().tenantId
-    enableSoftDelete: true
-    enabledForDeployment: false
-    enabledForDiskEncryption: false
-    enabledForTemplateDeployment: true
-    accessPolicies: [
-      // Add the function app principal as a policy so it can read secrets
-      {
-        tenantId: subscription().tenantId
-        objectId: functionApp.identity.principalId
-        permissions: {
-          secrets: [ 'get', 'list' ]
-        }
-      }
-      // Add the user-assigned identity so it can also read secrets
-      {
-        tenantId: subscription().tenantId
-        objectId: uai.properties.principalId
-        permissions: {
-          secrets: [ 'get', 'list' ]
-        }
-      }
-    ]
+  sku: {
+    name: 'Y1'
+    tier: 'Dynamic'
   }
-  dependsOn: [
-    functionApp
-    uai
-  ]
+  properties: {
+    reserved: true
+  }
 }
 
-output functionAppName string = functionApp.name
-output functionPrincipalId string = functionApp.identity.principalId
-output serviceBusNamespace string = sbNamespace.name
-output serviceBusQueue string = sbQueue.name
-output keyVaultNameOutput string = keyVault.name
+resource functionApp 'Microsoft.Web/sites@2023-01-01' = if (deployFunctionApp) {
+  name: functionAppName
+  location: location
+  kind: 'functionapp'
+  identity: {
+    type: 'SystemAssigned'
+  }
+  properties: {
+    serverFarmId: functionPlan.id
+    siteConfig: {
+      linuxFxVersion: 'PYTHON|3.11'
+      appSettings: [
+        {
+          name: 'FUNCTIONS_WORKER_RUNTIME'
+          value: 'python'
+        }
+        {
+          name: 'WEBSITE_RUN_FROM_PACKAGE'
+          value: '1'
+        }
+        {
+          name: 'SERVICE_BUS_QUEUE_NAME'
+          value: sbQueue.name
+        }
+        {
+          name: 'AzureWebJobsStorage'
+          value: functionStorageConnectionString
+        }
+        {
+          name: 'APPINSIGHTS_INSTRUMENTATIONKEY'
+          value: appInsights.properties.InstrumentationKey
+        }
+        {
+          name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
+          value: appInsights.properties.ConnectionString
+        }
+      ]
+    }
+  }
+}
 
-// Role assignment to allow the user-assigned identity to pull images from ACR
-// Uses the built-in AcrPull role definition id
+// Role assignment to allow identities to pull images from ACR.
 var acrPullRoleDef = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')
 
-resource acrPullAssignment 'Microsoft.Authorization/roleAssignments@2020-10-01-preview' = {
+resource acrPullAssignment 'Microsoft.Authorization/roleAssignments@2020-10-01-preview' = if (createUaiAcrPullAssignment) {
   name: guid(acr.id, uai.id, 'acrPull')
   properties: {
     roleDefinitionId: acrPullRoleDef
@@ -200,13 +146,6 @@ resource acrPullAssignment 'Microsoft.Authorization/roleAssignments@2020-10-01-p
   scope: acr
 }
 
-output userAssignedIdentityId string = uai.id
-output userAssignedIdentityPrincipalId string = uai.properties.principalId
-
-@description('Optional: principal id of an existing container app to grant AcrPull for (leave empty to skip)')
-param containerAppPrincipalId string = ''
-
-// Conditional role assignment to grant AcrPull to a container app principal (useful when container app is created outside this Bicep)
 resource containerAppAcrPull 'Microsoft.Authorization/roleAssignments@2020-10-01-preview' = if (containerAppPrincipalId != '') {
   name: guid(acr.id, containerAppPrincipalId, 'containerAppAcr')
   properties: {
@@ -217,101 +156,13 @@ resource containerAppAcrPull 'Microsoft.Authorization/roleAssignments@2020-10-01
   scope: acr
 }
 
-// Grant the user-assigned identity access to Blob Storage (Storage Blob Data Contributor)
-// GUID corresponds to the built-in 'Storage Blob Data Contributor' role.
-var storageBlobDataContributor = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
-
-resource storageRoleAssignment 'Microsoft.Authorization/roleAssignments@2020-10-01-preview' = {
-  name: guid(storage.id, uai.id, 'storageBlob')
-  properties: {
-    roleDefinitionId: storageBlobDataContributor
-    principalId: uai.properties.principalId
-    principalType: 'ServicePrincipal'
-  }
-  scope: storage
-}
-
-// Deployment script: create AAD app registration, service principal, federated credential,
-// create a client secret for fallback, store appId and secret in Key Vault, and assign roles.
-resource aadProvision 'Microsoft.Resources/deploymentScripts@2020-10-01' = {
-  name: 'provision-aad-app-${uniqueString(resourceGroup().id)}'
-  location: location
-  kind: 'AzureCLI'
-  identity: {
-    type: 'UserAssigned'
-    userAssignedIdentities: {
-      '${uai.id}': {}
-    }
-  }
-  properties: {
-    azCliVersion: '2.59.0'
-    scriptContent: '''
-set -euo pipefail
-APP_NAME="siphonbot-github-actions-${uniqueString(resourceGroup().id)}"
-APP_FILTER="displayName eq '$APP_NAME'"
-
-# find or create app
-EXISTING_APP_ID=$(az ad app list --filter "$APP_FILTER" --query "[0].appId" -o tsv)
-if [ -z "$EXISTING_APP_ID" ]; then
-  APP_JSON=$(az ad app create --display-name "$APP_NAME" --identifier-uris "api://$APP_NAME" -o json)
-  APP_ID=$(echo "$APP_JSON" | jq -r .appId)
-  APP_OBJECT_ID=$(echo "$APP_JSON" | jq -r .id)
-else
-  APP_ID="$EXISTING_APP_ID"
-  APP_OBJECT_ID=$(az ad app show --id "$APP_ID" --query id -o tsv)
-fi
-
-# ensure service principal exists
-SP_OBJECT_ID=$(az ad sp list --filter "appId eq '$APP_ID'" --query "[0].id" -o tsv)
-if [ -z "$SP_OBJECT_ID" ]; then
-  az ad sp create --id "$APP_ID"
-  SP_OBJECT_ID=$(az ad sp list --filter "appId eq '$APP_ID'" --query "[0].id" -o tsv)
-fi
-
-# create federated identity credential for GitHub Actions (issuer + subject)
-FIC_PAYLOAD=$(jq -n --arg name "github-actions-fic" --arg issuer "https://token.actions.githubusercontent.com" --arg subject "repo:${GITHUB_OWNER}/${GITHUB_REPO}:ref:refs/heads/main" '{name:$name, issuer:$issuer, subject:$subject, description:"GitHub Actions OIDC"}')
-az rest --method POST --uri "https://graph.microsoft.com/v1.0/applications/$APP_OBJECT_ID/federatedIdentityCredentials" --body "$FIC_PAYLOAD" || true
-
-# create client secret for fallback and store both appId and secret in Key Vault
-SECRET_NAME_CLIENT="siphonbot-ci-client-secret"
-SECRET_NAME_APPID="siphonbot-ci-app-id"
-CLIENT_SECRET=$(az ad app credential reset --id "$APP_ID" --append --years 2 --query password -o tsv)
-az keyvault secret set --vault-name "${keyVault.name}" --name "$SECRET_NAME_CLIENT" --value "$CLIENT_SECRET" >/dev/null
-az keyvault secret set --vault-name "${keyVault.name}" --name "$SECRET_NAME_APPID" --value "$APP_ID" >/dev/null
-
-# assign roles: AcrPush on ACR and Contributor on the resourceGroup
-ACR_SCOPE="${acr.id}"
-RG_SCOPE="/subscriptions/${subscription().subscriptionId}/resourceGroups/${resourceGroup().name}"
-az role assignment create --assignee-object-id "$SP_OBJECT_ID" --assignee-principal-type ServicePrincipal --role "AcrPush" --scope "$ACR_SCOPE" || true
-az role assignment create --assignee-object-id "$SP_OBJECT_ID" --assignee-principal-type ServicePrincipal --role "Contributor" --scope "$RG_SCOPE" || true
-
-echo "PROVISIONED_APP_ID=$APP_ID"
-echo "PROVISIONED_SP_OBJECT_ID=$SP_OBJECT_ID"
-'''
-    supportingScriptUris: []
-    timeout: 'PT30M'
-    cleanupPreference: 'OnSuccess'
-    retentionInterval: 'P1D'
-    environmentVariables: [
-      {
-        name: 'GITHUB_OWNER'
-        value: githubOwner
-      }
-      {
-        name: 'GITHUB_REPO'
-        value: githubRepo
-      }
-    ]
-  }
-  dependsOn: [
-    keyVault
-    acr
-  ]
-}
-
-// Expose Key Vault secret URIs for the appId and client secret
-var clientSecretName = 'siphonbot-ci-client-secret'
-var appIdSecretName = 'siphonbot-ci-app-id'
-
-output ciClientSecretUri string = 'https://${keyVault.name}.vault.azure.net/secrets/${clientSecretName}'
-output ciAppIdSecretUri string = 'https://${keyVault.name}.vault.azure.net/secrets/${appIdSecretName}'
+output acrLoginServer string = acr.properties.loginServer
+output acrName string = acr.name
+output appInsightsId string = appInsights.id
+output containerAppsEnvironmentId string = containerEnv.id
+output serviceBusNamespace string = sbNamespace.name
+output serviceBusQueue string = sbQueue.name
+output userAssignedIdentityId string = uai.id
+output userAssignedIdentityPrincipalId string = uai.properties.principalId
+output functionAppName string = deployFunctionApp ? functionApp!.name : ''
+output functionPrincipalId string = deployFunctionApp ? functionApp!.identity.principalId : ''

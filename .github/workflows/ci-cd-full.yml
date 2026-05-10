@@ -108,7 +108,6 @@ jobs:
           echo "RESOURCE_GROUP=${{ vars.RESOURCE_GROUP }}" >> $GITHUB_ENV
           echo "CONTAINERAPPS_ENV_ID=${{ vars.CONTAINERAPPS_ENV_ID || secrets.CONTAINERAPPS_ENV_ID || '' }}" >> $GITHUB_ENV
           echo "USER_ASSIGNED_IDENTITY_ID=${{ vars.USER_ASSIGNED_IDENTITY_ID || secrets.USER_ASSIGNED_IDENTITY_ID || '' }}" >> $GITHUB_ENV
-          echo "KEYVAULT_NAME=${{ vars.KEYVAULT_NAME || secrets.KEYVAULT_NAME || '' }}" >> $GITHUB_ENV
           echo "FUNCTION_NAME=${{ vars.FUNCTION_NAME }}" >> $GITHUB_ENV
           echo "IMAGE_NAME=${{ vars.IMAGE_NAME }}" >> $GITHUB_ENV
           echo "AZURE_TENANT_ID=${{ vars.AZURE_TENANT_ID }}" >> $GITHUB_ENV
@@ -169,9 +168,30 @@ jobs:
             Write-Host "Assigned AcrPull via az CLI fallback"
           }
 
-      - name: Expose function keyvault secrets to env
+      - name: Expose function app secrets list
         run: |
-          echo "FUNCTION_KEYVAULT_SECRETS=${{ secrets.FUNCTION_KEYVAULT_SECRETS }}" >> $GITHUB_ENV
+          echo "FUNCTION_APP_SECRETS=${{ secrets.FUNCTION_APP_SECRETS }}" >> $GITHUB_ENV
+
+      - name: Upsert Container App secrets
+        run: |
+          RG="${RESOURCE_GROUP}"
+          APP="${CONTAINERAPP_NAME}"
+
+          exists=$(az containerapp show -g "$RG" -n "$APP" --query name -o tsv || true)
+          if [ -z "$exists" ]; then
+            echo "Container App does not exist yet; secrets will be upserted after create."
+            exit 0
+          fi
+
+          az containerapp secret set -g "$RG" -n "$APP" --secrets \
+            siphonbot-reddit-client-id="${{ secrets.REDDIT_CLIENT_ID }}" \
+            siphonbot-reddit-client-secret="${{ secrets.REDDIT_CLIENT_SECRET }}" \
+            siphonbot-reddit-user-agent="${{ secrets.REDDIT_USER_AGENT }}" \
+            siphonbot-reddit-username="${{ secrets.REDDIT_USERNAME }}" \
+            siphonbot-reddit-password="${{ secrets.REDDIT_PASSWORD }}" \
+            siphonbot-discord-token="${{ secrets.DISCORD_TOKEN }}" \
+            siphonbot-discord-webhook="${{ secrets.WEBHOOK }}" \
+            siphonbot-service-bus-connection="${{ secrets.SERVICE_BUS_CONNECTION_STRING }}"
 
       - name: Create or update Container App
         run: |
@@ -202,7 +222,29 @@ jobs:
               echo "Configuring registry to use UAI for ACR pulls"
               az containerapp registry set -g $RG -n $APP --server "$REGISTRY_SERVER" --identity "$USER_ASSIGNED_IDENTITY_ID" || true
             fi
-            az containerapp update -g $RG -n $APP --image "$FULL_IMAGE"
+            echo "Updating Container App with image and secretref env vars..."
+            az containerapp secret set -g "$RG" -n "$APP" --secrets \
+              siphonbot-reddit-client-id="${{ secrets.REDDIT_CLIENT_ID }}" \
+              siphonbot-reddit-client-secret="${{ secrets.REDDIT_CLIENT_SECRET }}" \
+              siphonbot-reddit-user-agent="${{ secrets.REDDIT_USER_AGENT }}" \
+              siphonbot-reddit-username="${{ secrets.REDDIT_USERNAME }}" \
+              siphonbot-reddit-password="${{ secrets.REDDIT_PASSWORD }}" \
+              siphonbot-discord-token="${{ secrets.DISCORD_TOKEN }}" \
+              siphonbot-discord-webhook="${{ secrets.WEBHOOK }}" \
+              siphonbot-service-bus-connection="${{ secrets.SERVICE_BUS_CONNECTION_STRING }}"
+
+            az containerapp update -g $RG -n $APP --image "$FULL_IMAGE" \
+              --env-vars \
+                REDDIT_CLIENT_ID="secretref:siphonbot-reddit-client-id" \
+                REDDIT_CLIENT_SECRET="secretref:siphonbot-reddit-client-secret" \
+                REDDIT_USER_AGENT="secretref:siphonbot-reddit-user-agent" \
+                REDDIT_USERNAME="secretref:siphonbot-reddit-username" \
+                REDDIT_PASSWORD="secretref:siphonbot-reddit-password" \
+                DISCORD_TOKEN="secretref:siphonbot-discord-token" \
+                WEBHOOK="secretref:siphonbot-discord-webhook" \
+                SERVICE_BUS_CONNECTION_STRING="secretref:siphonbot-service-bus-connection" \
+                SERVICE_BUS_QUEUE_NAME="siphon-queue" \
+                MEDIA_TMP_DIR="/tmp/siphon"
           else
             # Create container app with identity+registry wiring so first revision can pull from ACR.
             if [ -n "${USER_ASSIGNED_IDENTITY_ID:-}" ]; then
@@ -217,7 +259,27 @@ jobs:
                 --max-replicas 1 \
                 --user-assigned "$USER_ASSIGNED_IDENTITY_ID" \
                 --registry-server "$REGISTRY_SERVER" \
-                --registry-identity "$USER_ASSIGNED_IDENTITY_ID"
+                --registry-identity "$USER_ASSIGNED_IDENTITY_ID" \
+                --secrets \
+                  siphonbot-reddit-client-id="${{ secrets.REDDIT_CLIENT_ID }}" \
+                  siphonbot-reddit-client-secret="${{ secrets.REDDIT_CLIENT_SECRET }}" \
+                  siphonbot-reddit-user-agent="${{ secrets.REDDIT_USER_AGENT }}" \
+                  siphonbot-reddit-username="${{ secrets.REDDIT_USERNAME }}" \
+                  siphonbot-reddit-password="${{ secrets.REDDIT_PASSWORD }}" \
+                  siphonbot-discord-token="${{ secrets.DISCORD_TOKEN }}" \
+                  siphonbot-discord-webhook="${{ secrets.WEBHOOK }}" \
+                  siphonbot-service-bus-connection="${{ secrets.SERVICE_BUS_CONNECTION_STRING }}" \
+                --env-vars \
+                  REDDIT_CLIENT_ID="secretref:siphonbot-reddit-client-id" \
+                  REDDIT_CLIENT_SECRET="secretref:siphonbot-reddit-client-secret" \
+                  REDDIT_USER_AGENT="secretref:siphonbot-reddit-user-agent" \
+                  REDDIT_USERNAME="secretref:siphonbot-reddit-username" \
+                  REDDIT_PASSWORD="secretref:siphonbot-reddit-password" \
+                  DISCORD_TOKEN="secretref:siphonbot-discord-token" \
+                  WEBHOOK="secretref:siphonbot-discord-webhook" \
+                  SERVICE_BUS_CONNECTION_STRING="secretref:siphonbot-service-bus-connection" \
+                  SERVICE_BUS_QUEUE_NAME="siphon-queue" \
+                  MEDIA_TMP_DIR="/tmp/siphon"
             else
               echo "No USER_ASSIGNED_IDENTITY_ID provided; creating app without managed registry identity"
               az containerapp create \
@@ -228,26 +290,77 @@ jobs:
                 --ingress 'external' \
                 --target-port 80 \
                 --min-replicas 0 \
-                --max-replicas 1
+                --max-replicas 1 \
+                --secrets \
+                  siphonbot-reddit-client-id="${{ secrets.REDDIT_CLIENT_ID }}" \
+                  siphonbot-reddit-client-secret="${{ secrets.REDDIT_CLIENT_SECRET }}" \
+                  siphonbot-reddit-user-agent="${{ secrets.REDDIT_USER_AGENT }}" \
+                  siphonbot-reddit-username="${{ secrets.REDDIT_USERNAME }}" \
+                  siphonbot-reddit-password="${{ secrets.REDDIT_PASSWORD }}" \
+                  siphonbot-discord-token="${{ secrets.DISCORD_TOKEN }}" \
+                  siphonbot-discord-webhook="${{ secrets.WEBHOOK }}" \
+                  siphonbot-service-bus-connection="${{ secrets.SERVICE_BUS_CONNECTION_STRING }}" \
+                --env-vars \
+                  REDDIT_CLIENT_ID="secretref:siphonbot-reddit-client-id" \
+                  REDDIT_CLIENT_SECRET="secretref:siphonbot-reddit-client-secret" \
+                  REDDIT_USER_AGENT="secretref:siphonbot-reddit-user-agent" \
+                  REDDIT_USERNAME="secretref:siphonbot-reddit-username" \
+                  REDDIT_PASSWORD="secretref:siphonbot-reddit-password" \
+                  DISCORD_TOKEN="secretref:siphonbot-discord-token" \
+                  WEBHOOK="secretref:siphonbot-discord-webhook" \
+                  SERVICE_BUS_CONNECTION_STRING="secretref:siphonbot-service-bus-connection" \
+                  SERVICE_BUS_QUEUE_NAME="siphon-queue" \
+                  MEDIA_TMP_DIR="/tmp/siphon"
             fi
           fi
 
-      - name: Configure Function App Key Vault references
-        if: env.FUNCTION_NAME != '' && env.FUNCTION_KEYVAULT_SECRETS != ''
+          echo "Ensuring EmptyDir ephemeral volume mount for downloads..."
+          az containerapp update -g "$RG" -n "$APP" \
+            --set template.volumes[0].name=ephemeral-downloads \
+                  template.volumes[0].storageType=EmptyDir \
+                  template.containers[0].volumeMounts[0].volumeName=ephemeral-downloads \
+                  template.containers[0].volumeMounts[0].mountPath=/tmp/siphon
+
+      - name: Configure Function App app settings from secrets
+        if: env.FUNCTION_NAME != '' && env.FUNCTION_APP_SECRETS != ''
         run: |
-          IFS=',' read -ra SECRETS <<< "${FUNCTION_KEYVAULT_SECRETS}"
-          KV=${{ env.KEYVAULT_NAME }}
+          IFS=',' read -ra PAIRS <<< "${FUNCTION_APP_SECRETS}"
           RG=${{ env.RESOURCE_GROUP }}
           APP=${{ env.FUNCTION_NAME }}
           settings=()
-          for s in "${SECRETS[@]}"; do
-            secretId=$(az keyvault secret show --vault-name "$KV" --name "$s" --query id -o tsv || true)
-            if [ -n "$secretId" ]; then
-              settings+=("$s=@Microsoft.KeyVault(SecretUri=${secretId})")
+          for pair in "${PAIRS[@]}"; do
+            if [ -n "$pair" ]; then
+              settings+=("$pair")
             fi
           done
           if [ ${#settings[@]} -gt 0 ]; then
             az functionapp config appsettings set --name "$APP" --resource-group "$RG" --settings "${settings[@]}"
           else
-            echo "No secrets found or FUNCTION_KEYVAULT_SECRETS not configured."
+            echo "No app settings found or FUNCTION_APP_SECRETS not configured."
           fi
+
+      - name: Ensure Function queue/app settings
+        if: env.FUNCTION_NAME != ''
+        run: |
+          RG=${{ env.RESOURCE_GROUP }}
+          APP=${{ env.FUNCTION_NAME }}
+          az functionapp config appsettings set \
+            --name "$APP" \
+            --resource-group "$RG" \
+            --settings SERVICE_BUS_QUEUE_NAME=siphon-queue FUNCTIONS_WORKER_RUNTIME=python
+
+      - name: Deploy Azure Functions code
+        if: env.FUNCTION_NAME != ''
+        run: |
+          RG=${{ env.RESOURCE_GROUP }}
+          APP=${{ env.FUNCTION_NAME }}
+          rm -f functionapp.zip
+          rm -rf function_package
+          mkdir -p function_package
+          cp -R azure_functions/. function_package/
+          cp -R python_files function_package/python_files
+          (cd function_package && zip -r ../functionapp.zip .)
+          az functionapp deployment source config-zip \
+            --resource-group "$RG" \
+            --name "$APP" \
+            --src functionapp.zip

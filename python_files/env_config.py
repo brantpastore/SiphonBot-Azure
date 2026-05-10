@@ -11,4 +11,6 @@ def load_env_variables():
         "REDDIT_PASSWORD": os.getenv("REDDIT_PASSWORD"),
         "DISCORD_TOKEN": os.getenv("DISCORD_TOKEN"),
         "WEBHOOK": os.getenv("WEBHOOK"),
+        "SERVICE_BUS_CONNECTION_STRING": os.getenv("SERVICE_BUS_CONNECTION_STRING"),
+        "SERVICE_BUS_QUEUE_NAME": os.getenv("SERVICE_BUS_QUEUE_NAME", "siphon-queue"),
     }

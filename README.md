@@ -41,7 +41,22 @@ REDDIT_USERNAME=your_username
 REDDIT_PASSWORD=your_password
 DISCORD_TOKEN=your_discord_bot_token
 WEBHOOK=your_discord_webhook_url
+SERVICE_BUS_CONNECTION_STRING=Endpoint=sb://...;SharedAccessKeyName=...;SharedAccessKey=...
+SERVICE_BUS_QUEUE_NAME=siphon-queue
+MEDIA_TMP_DIR=/tmp/siphon
 ```
+
+If SERVICE_BUS_CONNECTION_STRING is set, scrape commands run in hybrid mode:
+- The Container App bot enqueues a job to Service Bus.
+- The Azure Function worker processes the job and posts results to Discord via webhook.
+
+If SERVICE_BUS_CONNECTION_STRING is not set, the bot falls back to inline processing.
+
+For Azure Container Apps deployment, configure secret values in GitHub repository secrets.
+The CI/CD workflow writes these values into the Container App secrets section and maps
+runtime environment variables using `secretref:` entries.
+
+Container media downloads use ephemeral mounted storage (`EmptyDir`) at `/tmp/siphon`.
 
 ### Run with Docker
 
