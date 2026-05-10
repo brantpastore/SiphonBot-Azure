@@ -1,6 +1,7 @@
 import logging
 import os
 import sys
+import base64
 
 from env_config import load_env_variables
 from apis.reddit_api import RedditAuth
@@ -36,6 +37,45 @@ def _configure_logging() -> None:
     )
 
 
+def _configure_yt_dlp_cookies() -> None:
+    """
+    Materialize yt-dlp cookies from environment variables into a file.
+
+    Supported env vars:
+      - YTDLP_COOKIES: raw cookies.txt content
+      - YTDLP_COOKIES_B64: base64-encoded cookies.txt content
+      - YTDLP_COOKIES_FILE: optional explicit output path
+    """
+    logger = logging.getLogger(__name__)
+
+    raw = os.environ.get("YTDLP_COOKIES", "").strip()
+    b64 = os.environ.get("YTDLP_COOKIES_B64", "").strip()
+
+    if not raw and not b64:
+        logger.info("[startup] yt-dlp cookies not configured (YTDLP_COOKIES/YTDLP_COOKIES_B64 absent).")
+        return
+
+    cookie_content = raw
+    if not cookie_content and b64:
+        try:
+            cookie_content = base64.b64decode(b64).decode("utf-8")
+        except Exception as exc:
+            logger.error("[startup] Failed decoding YTDLP_COOKIES_B64: %s", exc)
+            return
+
+    cookie_file = os.environ.get("YTDLP_COOKIES_FILE", "/tmp/siphon/yt_cookies.txt")
+    cookie_dir = os.path.dirname(cookie_file) or "/tmp"
+    try:
+        os.makedirs(cookie_dir, exist_ok=True)
+        with open(cookie_file, "w", encoding="utf-8") as f:
+            f.write(cookie_content)
+        os.chmod(cookie_file, 0o600)
+        os.environ["YTDLP_COOKIES_FILE"] = cookie_file
+        logger.info("[startup] yt-dlp cookie file ready at %s", cookie_file)
+    except Exception as exc:
+        logger.error("[startup] Failed writing yt-dlp cookie file: %s", exc)
+
+
 if __name__ == "__main__":
     _configure_logging()
     logger = logging.getLogger(__name__)
@@ -48,6 +88,8 @@ if __name__ == "__main__":
         os.environ.get("CONTAINER_APP_REVISION", "<not set>"),
         os.environ.get("CONTAINER_APP_HOSTNAME", "<not set>"),
     )
+
+    _configure_yt_dlp_cookies()
 
     env_vars = load_env_variables()
 
