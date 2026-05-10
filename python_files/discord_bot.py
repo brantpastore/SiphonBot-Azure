@@ -207,7 +207,7 @@ class SiphonBot:
 
         @self.tree.command(
             name="download",
-            description="Download a YouTube, Instagram, or TikTok video and post it to this channel",
+            description="Download a YouTube, Instagram, TikTok, or Reddit video and post it to this channel",
         )
         async def dl_command(
             interaction: discord.Interaction,
@@ -222,10 +222,17 @@ class SiphonBot:
 
             self.set_cooldown(interaction.user.id)
             await interaction.response.defer()
-            await interaction.followup.send(f"Downloading: {url}")
             upload_limit = interaction.guild.filesize_limit if interaction.guild else None
             print(f"Guild upload limit: {upload_limit} bytes")
-            await self.media.download_and_send(interaction, url, upload_limit=upload_limit)
+
+            # Reddit URLs (posts and v.redd.it) require authenticated API access;
+            # route them through the reddit handler instead of yt-dlp.
+            if any(domain in url for domain in ("reddit.com", "redd.it", "v.redd.it")):
+                await interaction.followup.send(f"Fetching Reddit media: {url}")
+                await self.reddit.fetch_and_send(interaction, url, upload_limit=upload_limit)
+            else:
+                await interaction.followup.send(f"Downloading: {url}")
+                await self.media.download_and_send(interaction, url, upload_limit=upload_limit)
 
         @scrape_custom_command.autocomplete("filter_type")
         async def filter_type_autocomplete(
