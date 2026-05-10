@@ -88,6 +88,16 @@ class SiphonBot:
                 )
                 return
 
+            # Defer immediately to avoid interaction timeout (Discord has 3-second limit)
+            try:
+                await interaction.response.defer(ephemeral=False)
+            except discord.errors.NotFound:
+                logger.warning("Interaction token expired before defer; scrape command timed out")
+                return
+            except Exception as e:
+                logger.exception(f"Failed to defer interaction in scrape_command: {e}\n{traceback.format_exc()}")
+                return
+
             if subreddit_number in self.subreddits:
                 subreddit_url = self.subreddits[subreddit_number]
 
@@ -97,7 +107,6 @@ class SiphonBot:
                     num_posts = 1
 
                 self.set_cooldown(interaction.user.id)
-                await interaction.response.defer()
                 if self.queue_publisher:
                     await self.queue_publisher.enqueue_scrape_job(
                         subreddit=subreddit_url,
@@ -241,9 +250,19 @@ class SiphonBot:
                 return
 
             self.set_cooldown(interaction.user.id)
-            await interaction.response.defer()
+            
+            # Defer immediately to avoid interaction timeout (Discord has 3-second limit)
+            try:
+                await interaction.response.defer(ephemeral=False)
+            except discord.errors.NotFound:
+                logger.warning("Interaction token expired before defer; dl_command timed out")
+                return
+            except Exception as e:
+                logger.exception(f"Failed to defer interaction in dl_command: {e}\n{traceback.format_exc()}")
+                return
+            
             upload_limit = interaction.guild.filesize_limit if interaction.guild else None
-            print(f"Guild upload limit: {upload_limit} bytes")
+            logger.info(f"Guild upload limit: {upload_limit} bytes")
 
             # Reddit URLs (posts and v.redd.it) require authenticated API access;
             # route them through the reddit handler instead of yt-dlp.
