@@ -177,10 +177,12 @@ jobs:
         run: |
           # Prefer runtime FULL_IMAGE (set earlier via GITHUB_ENV), otherwise use the build job output
           FULL_IMAGE="${FULL_IMAGE:-${{ needs.build-and-push.outputs.full_image }}}"
+          REGISTRY_SERVER="${FULL_IMAGE%%/*}"
           RG="${RESOURCE_GROUP}"
           APP="${CONTAINERAPP_NAME}"
           ENV_ID="${CONTAINERAPPS_ENV_ID}"
           echo "Using FULL_IMAGE=$FULL_IMAGE"
+          echo "Using REGISTRY_SERVER=$REGISTRY_SERVER"
           if [ -z "$ENV_ID" ]; then echo "Container Apps environment ID not found. Ensure Bicep created the env."; exit 1; fi
 
           # If app exists, ensure UAI is assigned (so it can pull) then update image; otherwise create.
@@ -190,23 +192,36 @@ jobs:
             if [ -n "${USER_ASSIGNED_IDENTITY_ID:-}" ]; then
               echo "Assigning UAI to container app before update"
               az containerapp identity assign -g $RG -n $APP --user-assigned "$USER_ASSIGNED_IDENTITY_ID" || true
+              echo "Configuring registry to use UAI for ACR pulls"
+              az containerapp registry set -g $RG -n $APP --server "$REGISTRY_SERVER" --identity "$USER_ASSIGNED_IDENTITY_ID" || true
             fi
             az containerapp update -g $RG -n $APP --image "$FULL_IMAGE"
           else
-            # Create container app first, then assign identity
-            az containerapp create \
-              --resource-group "$RG" \
-              --name "$APP" \
-              --environment "$ENV_ID" \
-              --image "$FULL_IMAGE" \
-              --ingress 'external' \
-              --target-port 80 \
-              --min-replicas 0 \
-              --max-replicas 1
-            # Assign UAI after creation if provided
+            # Create container app with identity+registry wiring so first revision can pull from ACR.
             if [ -n "${USER_ASSIGNED_IDENTITY_ID:-}" ]; then
-              echo "Assigning UAI to newly created container app"
-              az containerapp identity assign -g $RG -n $APP --user-assigned "$USER_ASSIGNED_IDENTITY_ID" || true
+              az containerapp create \
+                --resource-group "$RG" \
+                --name "$APP" \
+                --environment "$ENV_ID" \
+                --image "$FULL_IMAGE" \
+                --ingress 'external' \
+                --target-port 80 \
+                --min-replicas 0 \
+                --max-replicas 1 \
+                --user-assigned "$USER_ASSIGNED_IDENTITY_ID" \
+                --registry-server "$REGISTRY_SERVER" \
+                --registry-identity "$USER_ASSIGNED_IDENTITY_ID"
+            else
+              echo "No USER_ASSIGNED_IDENTITY_ID provided; creating app without managed registry identity"
+              az containerapp create \
+                --resource-group "$RG" \
+                --name "$APP" \
+                --environment "$ENV_ID" \
+                --image "$FULL_IMAGE" \
+                --ingress 'external' \
+                --target-port 80 \
+                --min-replicas 0 \
+                --max-replicas 1
             fi
           fi
 
