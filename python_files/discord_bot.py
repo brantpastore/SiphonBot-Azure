@@ -1,5 +1,6 @@
 import aiohttp
 import discord
+import os
 import time
 from discord import app_commands
 from apis.reddit_api import RedditAuth, check_subreddit_exists
@@ -41,6 +42,7 @@ class SiphonBot:
         self.cooldowns: dict[int, float] = {}
         self.cooldown_seconds = 5
         self.queue_publisher = self._build_queue_publisher()
+        self.commands_synced = False
         self.setup_bot_commands()
 
     def _build_queue_publisher(self):
@@ -306,15 +308,24 @@ class SiphonBot:
 
     async def sync_commands(self):
         try:
-            synced = await self.tree.sync()
-            print(f"Synced {len(synced)} command(s)")
+            guild_id = os.environ.get("DISCORD_GUILD_ID", "").strip()
+            if guild_id.isdigit():
+                guild = discord.Object(id=int(guild_id))
+                self.tree.copy_global_to(guild=guild)
+                synced = await self.tree.sync(guild=guild)
+                print(f"Synced {len(synced)} guild command(s) to guild {guild_id}")
+            else:
+                synced = await self.tree.sync()
+                print(f"Synced {len(synced)} global command(s)")
         except Exception as e:
             print(f"Failed to sync commands: {e}")
 
     def run(self):
         @self.bot.event
         async def on_ready():
-            await self.sync_commands()
+            if not self.commands_synced:
+                await self.sync_commands()
+                self.commands_synced = True
             print(f"{self.bot.user} has connected to Discord!")
             print(f"Bot is active in {len(self.bot.guilds)} servers.")
             print("Ready to receive commands!")
