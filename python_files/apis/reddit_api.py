@@ -3,6 +3,10 @@ import aiohttp
 import requests
 import requests.auth
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class RedditAuth:
     def __init__(self, client_id, client_secret, username, password, user_agent):
@@ -49,7 +53,7 @@ class RedditAuth:
 
         # Reddit tokens expire in 3600s, refresh 5 min early
         self.expires_at = time.time() + result.get("expires_in", 3600) - 300
-        print("Reddit token refreshed.")
+        logger.info("Reddit token refreshed.")
 
 
 async def check_subreddit_exists(subreddit_name, reddit_auth):

@@ -51,10 +51,10 @@ class SiphonBot:
 
     def _build_queue_publisher(self):
         if not self.service_bus_connection:
-            print("Hybrid mode disabled: no Service Bus connection string. Using inline processing.")
+            logger.info("Hybrid mode disabled: no Service Bus connection string. Using inline processing.")
             return None
 
-        print(f"Hybrid mode enabled: queueing jobs to Service Bus queue '{self.service_bus_queue}'.")
+        logger.info("Hybrid mode enabled: queueing jobs to Service Bus queue '%s'.", self.service_bus_queue)
         return JobQueuePublisher(self.service_bus_connection, self.service_bus_queue)
 
     def check_cooldown(self, user_id: int) -> float:
@@ -124,7 +124,7 @@ class SiphonBot:
                         f"Starting to scrape {num_posts} posts from: r/{subreddit_url}"
                     )
                     upload_limit = interaction.guild.filesize_limit if interaction.guild else None
-                    print(f"Guild upload limit: {upload_limit} bytes")
+                    logger.info("Guild upload limit: %s bytes", upload_limit)
                     await self.reddit.scrape_subreddit(
                         interaction, subreddit_url, num_posts, filter_type, time_range,
                         upload_limit=upload_limit
@@ -167,7 +167,7 @@ class SiphonBot:
                     subreddit_name, self.reddit_auth
                 )
             except Exception as e:
-                print(f"Error checking subreddit existence: {e}")
+                logger.exception("Error checking subreddit existence: %s", e)
                 await interaction.response.send_message(
                     f"Error checking subreddit: {e}"
                 )
@@ -198,7 +198,7 @@ class SiphonBot:
                         f"Starting to scrape {num_posts} posts from: r/{subreddit_name}"
                     )
                     upload_limit = interaction.guild.filesize_limit if interaction.guild else None
-                    print(f"Guild upload limit: {upload_limit} bytes")
+                    logger.info("Guild upload limit: %s bytes", upload_limit)
                     await self.reddit.scrape_subreddit(
                         interaction,
                         subreddit_name,
@@ -231,7 +231,7 @@ class SiphonBot:
             await interaction.response.defer()
             await interaction.followup.send(f"Fetching Reddit post: {url}")
             upload_limit = interaction.guild.filesize_limit if interaction.guild else None
-            print(f"Guild upload limit: {upload_limit} bytes")
+            logger.info("Guild upload limit: %s bytes", upload_limit)
             await self.reddit.fetch_and_send(interaction, url, upload_limit=upload_limit)
 
         @self.tree.command(
@@ -353,24 +353,24 @@ class SiphonBot:
                 guild = discord.Object(id=int(guild_id))
                 self.tree.copy_global_to(guild=guild)
                 synced = await self.tree.sync(guild=guild)
-                print(f"Synced {len(synced)} guild command(s) to guild {guild_id}")
+                logger.info("Synced %s guild command(s) to guild %s", len(synced), guild_id)
             elif self.bot.guilds:
                 # Auto-detect guilds from the active bot session when no guild id is configured.
                 for g in self.bot.guilds:
                     guild = discord.Object(id=g.id)
                     self.tree.copy_global_to(guild=guild)
                     synced = await self.tree.sync(guild=guild)
-                    print(f"Auto-synced {len(synced)} guild command(s) to guild {g.id} ({g.name})")
+                    logger.info("Auto-synced %s guild command(s) to guild %s (%s)", len(synced), g.id, g.name)
             else:
-                print("DISCORD_GUILD_ID not set and no guilds available yet; skipping guild sync.")
+                logger.info("DISCORD_GUILD_ID not set and no guilds available yet; skipping guild sync.")
 
             if sync_global:
                 synced = await self.tree.sync()
-                print(f"Synced {len(synced)} global command(s)")
+                logger.info("Synced %s global command(s)", len(synced))
             elif not guild_id.isdigit() and not self.bot.guilds:
                 # Fallback so commands still get registered when guild cache is empty.
                 synced = await self.tree.sync()
-                print(f"Fallback: synced {len(synced)} global command(s)")
+                logger.info("Fallback: synced %s global command(s)", len(synced))
         except Exception as e:
             logger.exception(f"Failed to sync commands: {e}\n{traceback.format_exc()}")
 
@@ -380,9 +380,9 @@ class SiphonBot:
             if not self.commands_synced:
                 await self.sync_commands()
                 self.commands_synced = True
-            print(f"{self.bot.user} has connected to Discord!")
-            print(f"Bot is active in {len(self.bot.guilds)} servers.")
-            print("Ready to receive commands!")
+            logger.info("%s has connected to Discord!", self.bot.user)
+            logger.info("Bot is active in %s servers.", len(self.bot.guilds))
+            logger.info("Ready to receive commands!")
 
             try:
                 async with aiohttp.ClientSession() as session:

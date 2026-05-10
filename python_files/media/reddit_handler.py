@@ -95,7 +95,7 @@ class RedditMediaHandler:
     async def scrape_subreddit(
         self, interaction, subreddit_url, num_posts, filter_type, time_range, upload_limit=None
     ):
-        print(f"Scraping {num_posts} posts from: {subreddit_url}")
+        logger.info("Scraping %s posts from: %s", num_posts, subreddit_url)
 
         fetch_limit = num_posts + 5
 
@@ -119,7 +119,7 @@ class RedditMediaHandler:
                     p for p in posts if not should_skip(p.get("data", {}))
                 ][:num_posts]
 
-                print(f"Fetched {len(posts)} posts, {len(filtered)} after filtering.")
+                logger.info("Fetched %s posts, %s after filtering.", len(posts), len(filtered))
 
                 # Issue 23: Parallelize post processing with semaphore to avoid overwhelming single vCPU
                 sem = asyncio.Semaphore(2)
@@ -128,7 +128,7 @@ class RedditMediaHandler:
                     async with sem:
                         post_data = post.get("data", {})
                         if post_data:
-                            print("Moving to get_post_content for:", post_data.get("url"))
+                            logger.debug("Moving to get_post_content for: %s", post_data.get("url"))
                             await self.get_post_content(
                                 post_data,
                                 interaction,
@@ -160,7 +160,7 @@ class RedditMediaHandler:
             perm_url = post.get("permalink", "")
             reddit_post_url = urljoin("https://www.reddit.com", perm_url)
 
-            print("Getting post content for", url)
+            logger.info("Getting post content for %s", url)
 
             if gallery:
                 await self.process_gallery(post, title, interaction, nsfw)
@@ -250,7 +250,7 @@ class RedditMediaHandler:
             reddit_post_url = urljoin("https://www.reddit.com", perm_url)
             prefix = "NSFW: " if nsfw else ""
             message = f"{prefix}{title}\n{reddit_post_url}"
-            print(f"Gallery post detected - sending preview link: {reddit_post_url}")
+            logger.info("Gallery post detected - sending preview link: %s", reddit_post_url)
             await safe_followup(interaction, message)
         except Exception as e:
             logger.exception(f"Error processing gallery content: {e}\n{traceback.format_exc()}")
@@ -261,7 +261,7 @@ class RedditMediaHandler:
     async def process_image(
         self, image_url, title, reddit_post_url=None, interaction=None, nsfw=False, upload_limit=None, session=None
     ):
-        print("Image URL:", image_url)
+        logger.debug("Image URL: %s", image_url)
         limit = self._limit(upload_limit)
         workdir = make_workdir()
         image_filename = os.path.join(workdir, sanitize_filename(f"{title}.jpg"))
@@ -320,7 +320,7 @@ class RedditMediaHandler:
     async def process_video(
         self, video_url, title, backup_video=None, interaction=None, nsfw=False, upload_limit=None, session=None
     ):
-        print("Video URL:", video_url)
+        logger.debug("Video URL: %s", video_url)
         limit = self._limit(upload_limit)
         workdir = make_workdir()
         video_filename = None
@@ -352,8 +352,9 @@ class RedditMediaHandler:
                         else:
                             content_length = response.headers.get("Content-Length")
                             if content_length and int(content_length) > limit:
-                                print(
-                                    f"Video at {video_url} is larger than the upload limit, sending link."
+                                logger.info(
+                                    "Video at %s is larger than the upload limit, sending link.",
+                                    video_url,
                                 )
                                 prefix = "NSFW: " if nsfw else ""
                                 await send_content(
@@ -395,8 +396,9 @@ class RedditMediaHandler:
                     else:
                         content_length = response.headers.get("Content-Length")
                         if content_length and int(content_length) > limit:
-                            print(
-                                f"Video at {video_url} is larger than the upload limit, sending link."
+                            logger.info(
+                                "Video at %s is larger than the upload limit, sending link.",
+                                video_url,
                             )
                             prefix = "NSFW: " if nsfw else ""
                             await send_content(
@@ -415,16 +417,16 @@ class RedditMediaHandler:
                                 f.write(chunk)
 
             if not video_filename or not os.path.exists(video_filename):
-                print("Video file was not created.")
+                logger.error("Video file was not created.")
                 return
 
             file_size = os.path.getsize(video_filename)
             if file_size == 0:
-                print("Downloaded video file is empty.")
+                logger.error("Downloaded video file is empty.")
                 return
 
             if file_size > limit:
-                print("Downloaded video file is too large to send to Discord.")
+                logger.warning("Downloaded video file is too large to send to Discord.")
                 fallback_url = backup_video or video_url
                 trimmed_url = (
                     re.sub(r"/DASH.*", "", fallback_url)
@@ -484,7 +486,7 @@ class RedditMediaHandler:
         await loop.run_in_executor(
             None, lambda: subprocess.run(ffmpeg_cmd, check=True, timeout=300)
         )
-        print(f"Successfully processed video: {output_filename}")
+        logger.info("Successfully processed video: %s", output_filename)
 
     async def _remux_hls(self, source_url, output_filename):
         ffmpeg_cmd = [
@@ -504,12 +506,12 @@ class RedditMediaHandler:
         await loop.run_in_executor(
             None, lambda: subprocess.run(ffmpeg_cmd, check=True, timeout=300)
         )
-        print(f"Successfully remuxed HLS video: {output_filename}")
+        logger.info("Successfully remuxed HLS video: %s", output_filename)
 
     async def process_gif(
         self, gif_url, title, reddit_post_url=None, interaction=None, nsfw=False, upload_limit=None, session=None
     ):
-        print("Gif URL:", gif_url)
+        logger.debug("Gif URL: %s", gif_url)
         limit = self._limit(upload_limit)
         workdir = make_workdir()
         gif_filename = os.path.join(workdir, sanitize_filename(f"{title}.gif"))
@@ -523,7 +525,7 @@ class RedditMediaHandler:
                         response.raise_for_status()
                         content_length = response.headers.get("Content-Length")
                         if content_length and int(content_length) > limit:
-                            print(f"GIF too large, sending link instead: {gif_url}")
+                            logger.info("GIF too large, sending link instead: %s", gif_url)
                             prefix = "NSFW: " if nsfw else ""
                             await send_content(
                                 interaction, f"{prefix}{title}\n{reddit_post_url or gif_url}"
@@ -539,7 +541,7 @@ class RedditMediaHandler:
                     response.raise_for_status()
                     content_length = response.headers.get("Content-Length")
                     if content_length and int(content_length) > limit:
-                        print(f"GIF too large, sending link instead: {gif_url}")
+                        logger.info("GIF too large, sending link instead: %s", gif_url)
                         prefix = "NSFW: " if nsfw else ""
                         await send_content(
                             interaction, f"{prefix}{title}\n{reddit_post_url or gif_url}"
@@ -550,7 +552,7 @@ class RedditMediaHandler:
                             f.write(chunk)
 
             if os.path.getsize(gif_filename) > limit:
-                print(f"GIF too large, sending link instead: {gif_url}")
+                logger.info("GIF too large, sending link instead: %s", gif_url)
                 prefix = "NSFW: " if nsfw else ""
                 await send_content(
                     interaction, f"{prefix}{title}\n{reddit_post_url or gif_url}"

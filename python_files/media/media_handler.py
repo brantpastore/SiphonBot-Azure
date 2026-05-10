@@ -10,6 +10,7 @@ import discord
 from discord.ui import View, Button
 
 import yt_dlp
+from yt_dlp import version as yt_dlp_version
 
 logger = logging.getLogger(__name__)
 
@@ -108,14 +109,17 @@ class MediaHandler:
         return "generic"
 
     def _build_base_ydl_opts(self) -> dict:
+        debug_mode = os.environ.get("LOG_LEVEL", "INFO").upper() == "DEBUG"
         opts = {
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
+            "verbose": debug_mode,
             # bgutil PO token provider for YouTube bot-check bypass (script mode)
             "extractor_args": {
                 "youtube": {
                     "player_client": ["mweb"],
+                    "pot_trace": [debug_mode],
                 },
                 "youtubepot-bgutilscript": {
                     "server_home": ["/opt/bgutil-ytdlp-pot-provider/server"]
@@ -125,6 +129,21 @@ class MediaHandler:
         cookie_file = os.getenv("YTDLP_COOKIES_FILE", "").strip()
         if cookie_file:
             opts["cookiefile"] = cookie_file
+        logger.debug(
+            "yt-dlp base opts prepared (debug_mode=%s, yt_dlp_version=%s, cookiefile=%s, extractor_args=%s)",
+            debug_mode,
+            yt_dlp_version.__version__,
+            cookie_file or "<unset>",
+            {
+                "youtube": {
+                    "player_client": ["mweb"],
+                    "pot_trace": [debug_mode],
+                },
+                "youtubepot-bgutilscript": {
+                    "server_home": ["/opt/bgutil-ytdlp-pot-provider/server"],
+                },
+            },
+        )
         return opts
 
     def _get_cached_info(self, url: str):
@@ -289,7 +308,10 @@ class MediaHandler:
                 try:
                     await self._download_hls_remux(hls_manifest, raw_path)
                 except Exception as remux_err:
-                    print(f"HLS remux in compress failed, falling back to yt-dlp: {remux_err}")
+                    logger.warning(
+                        "HLS remux in compress failed, falling back to yt-dlp: %s",
+                        remux_err,
+                    )
                     await self._download(
                         url,
                         raw_path,
@@ -540,6 +562,14 @@ class MediaHandler:
 
         opts = self._build_base_ydl_opts()
         opts["skip_download"] = True
+        logger.info(
+            "Starting yt-dlp info extraction for %s (debug=%s, yt-dlp=%s, yt_dlp_plugin=%s, cookiefile=%s)",
+            url,
+            os.environ.get("LOG_LEVEL", "INFO").upper() == "DEBUG",
+            yt_dlp_version.__version__,
+            "bgutil-ytdlp-pot-provider",
+            opts.get("cookiefile", "<unset>"),
+        )
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(None, lambda: self._yt_extract(url, opts))
         if info is not None:
@@ -563,6 +593,14 @@ class MediaHandler:
                 "merge_output_format": "mp4",
                 "outtmpl": output_path,
             }
+        )
+        logger.info(
+            "Starting yt-dlp download for %s (format=%s, debug=%s, yt-dlp=%s, yt_dlp_plugin=%s)",
+            url,
+            fmt,
+            os.environ.get("LOG_LEVEL", "INFO").upper() == "DEBUG",
+            yt_dlp_version.__version__,
+            "bgutil-ytdlp-pot-provider",
         )
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: self._yt_download(url, opts))
