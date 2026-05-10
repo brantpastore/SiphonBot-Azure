@@ -483,45 +483,6 @@ jobs:
             fi
           fi
 
-          echo "Ensuring EmptyDir ephemeral volume mount for downloads..."
-          RG_SAVE="$RG"
-          APP_SAVE="$APP"
-          
-          # Get current app config and add volume mount via jq
-          CURRENT=$(az containerapp show -g "$RG_SAVE" -n "$APP_SAVE" -o json 2>/dev/null)
-          if [ -z "$CURRENT" ]; then
-            echo "Warning: Could not retrieve Container App config; skipping volume setup"
-            exit 0
-          fi
-          
-          # Check if volume already exists
-          VOLUME_EXISTS=$(echo "$CURRENT" | jq '.properties.template.volumes // [] | length > 0' 2>/dev/null || echo 'false')
-          
-          if [ "$VOLUME_EXISTS" = "false" ]; then
-            echo "Adding ephemeral volume to Container App..."
-            # Update config with volumes and volumeMounts using jq
-            UPDATED=$(echo "$CURRENT" | jq \
-              '.properties.template.volumes = [
-                {
-                  "name": "ephemeral-downloads",
-                  "storageType": "EmptyDir"
-                }
-              ] |
-              .properties.template.containers[0].volumeMounts = [
-                {
-                  "volumeName": "ephemeral-downloads",
-                  "mountPath": "/tmp/siphon"
-                }
-              ]')
-            
-            # Write to temp file and update
-            echo "$UPDATED" | jq '.properties' > /tmp/app-with-volume.json
-            az containerapp update -g "$RG_SAVE" -n "$APP_SAVE" --yaml /tmp/app-with-volume.json || {
-              echo "Warning: Volume configuration update failed; will retry on next deployment"
-            }
-            rm -f /tmp/app-with-volume.json
-          else
-            echo "Volume configuration already exists on Container App."
           fi
 
   start-container-app:
