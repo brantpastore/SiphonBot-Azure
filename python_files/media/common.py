@@ -6,7 +6,7 @@ import aiohttp
 import discord
 import shutil
 
-MAX_UPLOAD_BYTES = int(os.getenv("DISCORD_MAX_UPLOAD_MB", "10")) * 1024 * 1024
+MAX_UPLOAD_BYTES = int(os.getenv("DISCORD_MAX_UPLOAD_MB", "25")) * 1024 * 1024
 
 
 def make_workdir():

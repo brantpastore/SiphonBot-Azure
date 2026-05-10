@@ -89,23 +89,23 @@ class RedditMediaHandler:
                     response.raise_for_status()
                     data = await response.json()
 
-            posts = data.get("data", {}).get("children", [])
-            filtered = [
-                p for p in posts if not should_skip(p.get("data", {}))
-            ][:num_posts]
+                posts = data.get("data", {}).get("children", [])
+                filtered = [
+                    p for p in posts if not should_skip(p.get("data", {}))
+                ][:num_posts]
 
-            print(f"Fetched {len(posts)} posts, {len(filtered)} after filtering.")
+                print(f"Fetched {len(posts)} posts, {len(filtered)} after filtering.")
 
-            for post in filtered:
-                post_data = post.get("data", {})
-                if post_data:
-                    print("Moving to get_post_content for:", post_data.get("url"))
-                    await self.get_post_content(
-                        post_data,
-                        interaction,
-                        upload_limit=upload_limit,
-                        session=session,
-                    )
+                for post in filtered:
+                    post_data = post.get("data", {})
+                    if post_data:
+                        print("Moving to get_post_content for:", post_data.get("url"))
+                        await self.get_post_content(
+                            post_data,
+                            interaction,
+                            upload_limit=upload_limit,
+                            session=session,
+                        )
 
         except aiohttp.ClientResponseError as http_err:
             print(f"HTTP error occurred: {http_err}")
@@ -150,19 +150,19 @@ class RedditMediaHandler:
             )
             gif = url if lowered.endswith(".gif") else None
 
-            if video:
+            if hls_video:
                 await self.process_video(
-                    video,
+                    hls_video,
                     title,
-                    backup_video=None,
+                    backup_video=video,
                     interaction=interaction,
                     nsfw=nsfw,
                     upload_limit=upload_limit,
                     session=session,
                 )
-            elif hls_video:
+            elif video:
                 await self.process_video(
-                    hls_video,
+                    video,
                     title,
                     backup_video=None,
                     interaction=interaction,
@@ -312,7 +312,11 @@ class RedditMediaHandler:
                             )
                             await self._remux_hls(video_url, video_filename)
                             if os.path.exists(video_filename) and os.path.getsize(video_filename) > limit:
-                                await self._run_ffmpeg(video_url, video_filename)
+                                compressed_path = os.path.join(
+                                    workdir, sanitize_filename(f"{title}_compressed.mp4")
+                                )
+                                await self._run_ffmpeg(video_filename, compressed_path)
+                                video_filename = compressed_path
                         else:
                             content_length = response.headers.get("Content-Length")
                             if content_length and int(content_length) > limit:
@@ -351,7 +355,11 @@ class RedditMediaHandler:
                         )
                         await self._remux_hls(video_url, video_filename)
                         if os.path.exists(video_filename) and os.path.getsize(video_filename) > limit:
-                            await self._run_ffmpeg(video_url, video_filename)
+                            compressed_path = os.path.join(
+                                workdir, sanitize_filename(f"{title}_compressed.mp4")
+                            )
+                            await self._run_ffmpeg(video_filename, compressed_path)
+                            video_filename = compressed_path
                     else:
                         content_length = response.headers.get("Content-Length")
                         if content_length and int(content_length) > limit:
@@ -418,12 +426,12 @@ class RedditMediaHandler:
         finally:
             cleanup(workdir, video_filename)
 
-    async def _run_ffmpeg(self, source_url, output_filename):
+    async def _run_ffmpeg(self, input_path, output_filename):
         ffmpeg_cmd = [
             "ffmpeg",
             "-y",
             "-i",
-            source_url,
+            input_path,
             "-c:v",
             "libx264",
             "-crf",
@@ -548,13 +556,13 @@ class RedditMediaHandler:
                     response.raise_for_status()
                     data = await response.json()
 
-            post_data = data[0]["data"]["children"][0]["data"]
-            await self.get_post_content(
-                post_data,
-                interaction,
-                upload_limit=upload_limit,
-                session=session,
-            )
+                post_data = data[0]["data"]["children"][0]["data"]
+                await self.get_post_content(
+                    post_data,
+                    interaction,
+                    upload_limit=upload_limit,
+                    session=session,
+                )
 
         except Exception as e:
             print(f"Error fetching Reddit post: {e}")

@@ -1,7 +1,9 @@
 import asyncio
+import glob
 import math
 import os
 import subprocess
+import time
 import discord
 from discord.ui import View, Button
 
@@ -89,7 +91,94 @@ class OversizeView(View):
 
 class MediaHandler:
     def __init__(self):
-        pass
+        self._info_cache: dict[str, tuple[float, dict]] = {}
+        self._cache_ttl_seconds = int(os.getenv("MEDIA_INFO_CACHE_TTL_SECONDS", "600"))
+
+    @staticmethod
+    def _domain_kind(url: str) -> str:
+        lowered = (url or "").lower()
+        if any(domain in lowered for domain in ("youtube.com", "youtu.be")):
+            return "youtube"
+        if any(domain in lowered for domain in ("twitter.com", "x.com", "t.co")):
+            return "twitter"
+        return "generic"
+
+    def _build_base_ydl_opts(self) -> dict:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+        }
+        cookie_file = os.getenv("YTDLP_COOKIES_FILE", "").strip()
+        if cookie_file:
+            opts["cookiefile"] = cookie_file
+        return opts
+
+    def _get_cached_info(self, url: str):
+        cached = self._info_cache.get(url)
+        if not cached:
+            return None
+        ts, info = cached
+        if (time.time() - ts) > self._cache_ttl_seconds:
+            self._info_cache.pop(url, None)
+            return None
+        return info
+
+    def _set_cached_info(self, url: str, info: dict):
+        self._info_cache[url] = (time.time(), info)
+
+    @staticmethod
+    def _pick_hls_manifest(info: dict | None) -> str | None:
+        if not isinstance(info, dict):
+            return None
+
+        direct_protocol = str(info.get("protocol", ""))
+        direct_url = info.get("url")
+        if direct_url and "m3u8" in direct_protocol:
+            return direct_url
+
+        requested = info.get("requested_formats") or []
+        for fmt in requested:
+            protocol = str(fmt.get("protocol", ""))
+            url = fmt.get("url")
+            if url and "m3u8" in protocol:
+                return url
+
+        formats = info.get("formats") or []
+        hls_candidates = [f for f in formats if f.get("url") and "m3u8" in str(f.get("protocol", ""))]
+        if not hls_candidates:
+            return None
+
+        # Prefer higher quality candidate when multiple HLS renditions are available.
+        best = max(
+            hls_candidates,
+            key=lambda f: (
+                f.get("height") or 0,
+                f.get("tbr") or 0,
+                f.get("fps") or 0,
+            ),
+        )
+        return best.get("url")
+
+    def _format_selector(self, url: str, limit_mb: int) -> str:
+        kind = self._domain_kind(url)
+        if kind == "youtube":
+            # Try a single-file mp4 first for speed, then fallback to merged formats.
+            return (
+                f"best[ext=mp4][filesize<{limit_mb}M]"
+                f"/best[filesize<{limit_mb}M]"
+                f"/bestvideo[ext=mp4][filesize<{limit_mb}M]+bestaudio[ext=m4a]"
+                f"/bestvideo+bestaudio/best"
+            )
+        if kind == "twitter":
+            # Prefer direct MP4 variants and avoid m3u8 where possible.
+            return (
+                f"best[ext=mp4][protocol!=m3u8_native][protocol!=m3u8][filesize<{limit_mb}M]"
+                f"/best[ext=mp4][filesize<{limit_mb}M]"
+                f"/best[ext=mp4][protocol!=m3u8_native][protocol!=m3u8]"
+                f"/best[ext=mp4]/best"
+            )
+        return f"best[ext=mp4][filesize<{limit_mb}M]/best[filesize<{limit_mb}M]/best"
 
     async def download_and_send(self, interaction, url, upload_limit=None):
         if not is_safe_url(url):
@@ -110,8 +199,10 @@ class MediaHandler:
 
             title = info.get("title", "video")
             estimated_size = self._estimate_filesize(info)
+            effective_limit = (upload_limit or MAX_UPLOAD_BYTES) - (1 * 1024 * 1024)
 
-            if estimated_size and estimated_size > MAX_DOWNLOAD_BYTES:
+            # Metadata-based short-circuit: decide oversize before downloading body.
+            if estimated_size and estimated_size > effective_limit:
                 est_mb = estimated_size // (1024 * 1024)
                 limit_mb = (
                     upload_limit // (1024 * 1024)
@@ -132,7 +223,17 @@ class MediaHandler:
             filename = sanitize_filename(f"{title}.mp4")
             filepath = os.path.join(workdir, filename)
 
-            await self._download(url, filepath, upload_limit=upload_limit)
+            # Fast path: if metadata points to an HLS stream, remux it directly to mp4
+            # using stream copy. This avoids a full re-encode and is typically much faster.
+            hls_manifest = self._pick_hls_manifest(info)
+            if hls_manifest:
+                try:
+                    await self._download_hls_remux(hls_manifest, filepath)
+                except Exception as remux_err:
+                    print(f"HLS remux fast-path failed, falling back to yt-dlp: {remux_err}")
+                    await self._download(url, filepath, upload_limit=upload_limit)
+            else:
+                await self._download(url, filepath, upload_limit=upload_limit)
 
             if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
                 await safe_followup(interaction, "Download failed - file is empty.")
@@ -140,7 +241,7 @@ class MediaHandler:
 
             file_size = os.path.getsize(filepath)
             if file_size > (upload_limit or MAX_UPLOAD_BYTES):
-                compress_viable = can_compress(info)
+                compress_viable = can_compress(info, upload_limit=upload_limit)
                 view = OversizeView(
                     self, interaction, url, info, compress_viable=compress_viable, upload_limit=upload_limit
                 )
@@ -296,38 +397,39 @@ class MediaHandler:
 
             limit = (upload_limit or MAX_UPLOAD_BYTES) - (1 * 1024 * 1024)
             num_parts = math.ceil(file_size / limit)
-            segment_duration = math.floor(duration / num_parts)
+            segment_duration = max(1, math.floor(duration / num_parts))
+            segment_pattern = os.path.join(workdir, "segment_%03d.mp4")
 
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                raw_path,
+                "-c",
+                "copy",
+                "-f",
+                "segment",
+                "-segment_time",
+                str(segment_duration),
+                "-reset_timestamps",
+                "1",
+                "-map",
+                "0",
+                segment_pattern,
+            ]
+
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(ffmpeg_cmd, check=True, timeout=600),
+            )
+
+            part_files = sorted(glob.glob(os.path.join(workdir, "segment_*.mp4")))
             parts = []
-            for i in range(num_parts):
-                start = i * segment_duration
-                end = min(start + segment_duration, int(duration))
-                part_path = os.path.join(
-                    workdir, sanitize_filename(f"{title}_part{i + 1}.mp4")
-                )
-                ffmpeg_cmd = [
-                    "ffmpeg",
-                    "-y",
-                    "-ss",
-                    str(start),
-                    "-i",
-                    raw_path,
-                    "-t",
-                    str(segment_duration),
-                    "-c",
-                    "copy",
-                    "-avoid_negative_ts",
-                    "make_zero",
-                    part_path,
-                ]
-
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(
-                    None,
-                    lambda cmd=ffmpeg_cmd: subprocess.run(cmd, check=True, timeout=300),
-                )
-
+            for idx, part_path in enumerate(part_files):
                 if os.path.exists(part_path) and os.path.getsize(part_path) > 0:
+                    start = idx * segment_duration
+                    end = min(start + segment_duration, int(duration))
                     parts.append((part_path, start, end))
 
             for idx, (part_path, start, end) in enumerate(parts):
@@ -396,13 +498,17 @@ class MediaHandler:
         return None
 
     async def _extract_info(self, url):
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-        }
+        cached = self._get_cached_info(url)
+        if cached is not None:
+            return cached
+
+        opts = self._build_base_ydl_opts()
+        opts["skip_download"] = True
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: self._yt_extract(url, opts))
+        info = await loop.run_in_executor(None, lambda: self._yt_extract(url, opts))
+        if info is not None:
+            self._set_cached_info(url, info)
+        return info
 
     MERGE_DOMAINS = ["youtube.com", "youtu.be"]
 
@@ -410,19 +516,38 @@ class MediaHandler:
         limit_mb = (upload_limit or MAX_UPLOAD_BYTES) // (1024 * 1024) - 5
         if format_str:
             fmt = format_str
-        elif any(domain in url for domain in self.MERGE_DOMAINS):
-            fmt = f"best[ext=mp4][filesize<{limit_mb}M]/best[filesize<{limit_mb}M]/bestvideo[ext=mp4][filesize<{limit_mb}M]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
         else:
-            fmt = f"best[filesize<{limit_mb}M]/best"
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "format": fmt,
-            "merge_output_format": "mp4",
-            "outtmpl": output_path,
-        }
+            fmt = self._format_selector(url, limit_mb)
+        opts = self._build_base_ydl_opts()
+        opts.update(
+            {
+                "format": fmt,
+                "merge_output_format": "mp4",
+                "outtmpl": output_path,
+            }
+        )
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: self._yt_download(url, opts))
+
+    async def _download_hls_remux(self, manifest_url: str, output_path: str):
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            manifest_url,
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            "-bsf:a",
+            "aac_adtstoasc",
+            output_path,
+        ]
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: subprocess.run(cmd, check=True, timeout=300),
+        )
 
     @staticmethod
     def _yt_extract(url, opts):

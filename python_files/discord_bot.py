@@ -184,8 +184,15 @@ class SiphonBot:
                     await interaction.followup.send(
                         f"Starting to scrape {num_posts} posts from: r/{subreddit_name}"
                     )
+                    upload_limit = interaction.guild.filesize_limit if interaction.guild else None
+                    print(f"Guild upload limit: {upload_limit} bytes")
                     await self.reddit.scrape_subreddit(
-                        interaction, subreddit_name, num_posts, filter_type, time_range
+                        interaction,
+                        subreddit_name,
+                        num_posts,
+                        filter_type,
+                        time_range,
+                        upload_limit=upload_limit,
                     )
             else:
                 await interaction.response.send_message(

@@ -714,11 +714,19 @@ jobs:
             REV_HEALTH_STATE=$(az containerapp revision show -g "$RG" -n "$APP" --revision "$CHECK_REVISION" --query properties.healthState -o tsv 2>/dev/null || true)
             REV_TRAFFIC=$(az containerapp revision show -g "$RG" -n "$APP" --revision "$CHECK_REVISION" --query properties.trafficWeight -o tsv 2>/dev/null || true)
             REV_REPLICAS=$(az containerapp revision list -g "$RG" -n "$APP" --query "[?name=='$CHECK_REVISION'].properties.replicas | [0]" -o tsv 2>/dev/null || true)
+            REV_ACTIVE=$(az containerapp revision list -g "$RG" -n "$APP" --query "[?name=='$CHECK_REVISION'].properties.active | [0]" -o tsv 2>/dev/null || true)
 
-            echo "Attempt $i/$ATTEMPTS: provisioningState=$PROVISIONING_STATE runningStatus=$RUNNING_STATUS minReplicas=$MIN_REPLICAS latestRevision=$LATEST_REVISION latestReadyRevision=$LATEST_READY_REVISION checkRevision=$CHECK_REVISION revRunningState=$REV_RUNNING_STATE revHealthState=$REV_HEALTH_STATE revTrafficWeight=$REV_TRAFFIC revReplicas=$REV_REPLICAS"
+            echo "Attempt $i/$ATTEMPTS: provisioningState=$PROVISIONING_STATE runningStatus=$RUNNING_STATUS minReplicas=$MIN_REPLICAS latestRevision=$LATEST_REVISION latestReadyRevision=$LATEST_READY_REVISION checkRevision=$CHECK_REVISION revActive=$REV_ACTIVE revRunningState=$REV_RUNNING_STATE revHealthState=$REV_HEALTH_STATE revTrafficWeight=$REV_TRAFFIC revReplicas=$REV_REPLICAS"
 
             if [ "$PROVISIONING_STATE" = "Succeeded" ] && [ "$RUNNING_STATUS" = "Running" ] && [ "$REV_RUNNING_STATE" = "Running" ]; then
               echo "Container App health check passed (active revision: $CHECK_REVISION)."
+              exit 0
+            fi
+
+            # Worker-style apps (ingress disabled) can report runningStatus=Stopped and
+            # trafficWeight=0 while the revision is still Active/Healthy/Provisioned.
+            if [ "$PROVISIONING_STATE" = "Succeeded" ] && [ "$REV_ACTIVE" = "true" ] && [ "$REV_HEALTH_STATE" = "Healthy" ] && [ "$LATEST_READY_REVISION" = "$CHECK_REVISION" ] && [ "$REV_RUNNING_STATE" != "ActivationFailed" ]; then
+              echo "Container App health check passed (worker revision is Active + Healthy + Ready)."
               exit 0
             fi
 
@@ -744,8 +752,8 @@ jobs:
 
             # If a concurrent CI run has promoted a newer revision that is already Running,
             # treat this as a pass — our revision was superseded, not broken.
-            if [ -n "$TRAFFIC_REVISION" ] && [ "$TRAFFIC_REVISION" != "$DEPLOYED_REVISION" ] && [ "$REV_RUNNING_STATE" = "Running" ]; then
-              echo "Revision $DEPLOYED_REVISION was superseded by $TRAFFIC_REVISION which is Running. Health check passed."
+            if [ -n "$TRAFFIC_REVISION" ] && [ "$TRAFFIC_REVISION" != "$DEPLOYED_REVISION" ] && { [ "$REV_RUNNING_STATE" = "Running" ] || [ "$REV_RUNNING_STATE" = "RunningAtMaxScale" ]; }; then
+              echo "Revision $DEPLOYED_REVISION was superseded by $TRAFFIC_REVISION which is healthy/running. Health check passed."
               exit 0
             fi
 
