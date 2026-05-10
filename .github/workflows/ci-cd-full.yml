@@ -413,72 +413,67 @@ jobs:
                 SERVICE_BUS_QUEUE_NAME="siphon-queue" \
                 MEDIA_TMP_DIR="/tmp/siphon"
           else
-            # Create container app via YAML template to support volumes
+            # Create container app via direct YAML file approach
             if [ -n "${USER_ASSIGNED_IDENTITY_ID:-}" ]; then
               SERVICE_BUS_CONN="${SERVICE_BUS_CONNECTION_STRING:-${{ secrets.SERVICE_BUS_CONNECTION_STRING }}}"
               
-              cat > /tmp/containerapp.yaml <<'YAML_EOF'
-properties:
-  environmentId: ENV_ID_PLACEHOLDER
-  configuration:
-    activeRevisionsMode: Single
-    registries:
-      - server: REGISTRY_SERVER_PLACEHOLDER
-        identity: USER_ASSIGNED_ID_PLACEHOLDER
-    ingress:
-      external: true
-      targetPort: 80
-      transport: Auto
-  identity:
-    type: UserAssigned
-    userAssignedIdentities:
-      - USER_ASSIGNED_ID_PLACEHOLDER
-  template:
-    containers:
-      - name: siphonbot-app
-        image: IMAGE_PLACEHOLDER
-        resources:
-          cpu: 0.5
-          memory: 1Gi
-        env:
-          - name: REDDIT_CLIENT_ID
-            secretRef: siphonbot-reddit-client-id
-          - name: REDDIT_CLIENT_SECRET
-            secretRef: siphonbot-reddit-client-secret
-          - name: REDDIT_USER_AGENT
-            secretRef: siphonbot-reddit-user-agent
-          - name: REDDIT_USERNAME
-            secretRef: siphonbot-reddit-username
-          - name: REDDIT_PASSWORD
-            secretRef: siphonbot-reddit-password
-          - name: DISCORD_TOKEN
-            secretRef: siphonbot-discord-token
-          - name: WEBHOOK
-            secretRef: siphonbot-discord-webhook
-          - name: SERVICE_BUS_CONNECTION_STRING
-            secretRef: siphonbot-service-bus-connection
-          - name: SERVICE_BUS_QUEUE_NAME
-            value: siphon-queue
-          - name: MEDIA_TMP_DIR
-            value: /tmp/siphon
-        volumeMounts:
-          - volumeName: ephemeral-downloads
-            mountPath: /tmp/siphon
-    volumes:
-      - name: ephemeral-downloads
-        storageType: EmptyDir
-    scale:
-      minReplicas: 0
-      maxReplicas: 1
-YAML_EOF
+              # Build YAML file step by step to avoid heredoc parsing issues
+              {
+                echo "properties:"
+                echo "  environmentId: $ENV_ID"
+                echo "  configuration:"
+                echo "    activeRevisionsMode: Single"
+                echo "    registries:"
+                echo "      - server: $REGISTRY_SERVER"
+                echo "        identity: $USER_ASSIGNED_IDENTITY_ID"
+                echo "    ingress:"
+                echo "      external: true"
+                echo "      targetPort: 80"
+                echo "      transport: Auto"
+                echo "  identity:"
+                echo "    type: UserAssigned"
+                echo "    userAssignedIdentities:"
+                echo "      - $USER_ASSIGNED_IDENTITY_ID"
+                echo "  template:"
+                echo "    containers:"
+                echo "      - name: siphonbot-app"
+                echo "        image: $FULL_IMAGE"
+                echo "        resources:"
+                echo "          cpu: 0.5"
+                echo "          memory: 1Gi"
+                echo "        env:"
+                echo "          - name: REDDIT_CLIENT_ID"
+                echo "            secretRef: siphonbot-reddit-client-id"
+                echo "          - name: REDDIT_CLIENT_SECRET"
+                echo "            secretRef: siphonbot-reddit-client-secret"
+                echo "          - name: REDDIT_USER_AGENT"
+                echo "            secretRef: siphonbot-reddit-user-agent"
+                echo "          - name: REDDIT_USERNAME"
+                echo "            secretRef: siphonbot-reddit-username"
+                echo "          - name: REDDIT_PASSWORD"
+                echo "            secretRef: siphonbot-reddit-password"
+                echo "          - name: DISCORD_TOKEN"
+                echo "            secretRef: siphonbot-discord-token"
+                echo "          - name: WEBHOOK"
+                echo "            secretRef: siphonbot-discord-webhook"
+                echo "          - name: SERVICE_BUS_CONNECTION_STRING"
+                echo "            secretRef: siphonbot-service-bus-connection"
+                echo "          - name: SERVICE_BUS_QUEUE_NAME"
+                echo "            value: siphon-queue"
+                echo "          - name: MEDIA_TMP_DIR"
+                echo "            value: /tmp/siphon"
+                echo "        volumeMounts:"
+                echo "          - volumeName: ephemeral-downloads"
+                echo "            mountPath: /tmp/siphon"
+                echo "    volumes:"
+                echo "      - name: ephemeral-downloads"
+                echo "        storageType: EmptyDir"
+                echo "    scale:"
+                echo "      minReplicas: 0"
+                echo "      maxReplicas: 1"
+              } > /tmp/containerapp.yaml
               
-              # Replace placeholders
-              sed -i "s|ENV_ID_PLACEHOLDER|$ENV_ID|g" /tmp/containerapp.yaml
-              sed -i "s|REGISTRY_SERVER_PLACEHOLDER|$REGISTRY_SERVER|g" /tmp/containerapp.yaml
-              sed -i "s|USER_ASSIGNED_ID_PLACEHOLDER|$USER_ASSIGNED_IDENTITY_ID|g" /tmp/containerapp.yaml
-              sed -i "s|IMAGE_PLACEHOLDER|$FULL_IMAGE|g" /tmp/containerapp.yaml
-              
-              # Create container app with YAML template including volumes and UAI
+              # Create container app with YAML template including volumes
               az containerapp create \
                 --resource-group "$RG" \
                 --name "$APP" \
@@ -494,63 +489,59 @@ YAML_EOF
                 --yaml /tmp/containerapp.yaml
               rm -f /tmp/containerapp.yaml
             else
-              # Create container app via YAML template to support volumes
+              # Create container app via direct YAML file approach (no UAI)
               SERVICE_BUS_CONN="${SERVICE_BUS_CONNECTION_STRING:-${{ secrets.SERVICE_BUS_CONNECTION_STRING }}}"
               
-              cat > /tmp/containerapp.yaml <<'YAML_EOF'
-properties:
-  environmentId: ENV_ID_PLACEHOLDER
-  configuration:
-    activeRevisionsMode: Single
-    registries:
-      - server: REGISTRY_SERVER_PLACEHOLDER
-    ingress:
-      external: true
-      targetPort: 80
-      transport: Auto
-  template:
-    containers:
-      - name: siphonbot-app
-        image: IMAGE_PLACEHOLDER
-        resources:
-          cpu: 0.5
-          memory: 1Gi
-        env:
-          - name: REDDIT_CLIENT_ID
-            secretRef: siphonbot-reddit-client-id
-          - name: REDDIT_CLIENT_SECRET
-            secretRef: siphonbot-reddit-client-secret
-          - name: REDDIT_USER_AGENT
-            secretRef: siphonbot-reddit-user-agent
-          - name: REDDIT_USERNAME
-            secretRef: siphonbot-reddit-username
-          - name: REDDIT_PASSWORD
-            secretRef: siphonbot-reddit-password
-          - name: DISCORD_TOKEN
-            secretRef: siphonbot-discord-token
-          - name: WEBHOOK
-            secretRef: siphonbot-discord-webhook
-          - name: SERVICE_BUS_CONNECTION_STRING
-            secretRef: siphonbot-service-bus-connection
-          - name: SERVICE_BUS_QUEUE_NAME
-            value: siphon-queue
-          - name: MEDIA_TMP_DIR
-            value: /tmp/siphon
-        volumeMounts:
-          - volumeName: ephemeral-downloads
-            mountPath: /tmp/siphon
-    volumes:
-      - name: ephemeral-downloads
-        storageType: EmptyDir
-    scale:
-      minReplicas: 0
-      maxReplicas: 1
-YAML_EOF
-              
-              # Replace placeholders
-              sed -i "s|ENV_ID_PLACEHOLDER|$ENV_ID|g" /tmp/containerapp.yaml
-              sed -i "s|REGISTRY_SERVER_PLACEHOLDER|$REGISTRY_SERVER|g" /tmp/containerapp.yaml
-              sed -i "s|IMAGE_PLACEHOLDER|$FULL_IMAGE|g" /tmp/containerapp.yaml
+              # Build YAML file step by step to avoid heredoc parsing issues
+              {
+                echo "properties:"
+                echo "  environmentId: $ENV_ID"
+                echo "  configuration:"
+                echo "    activeRevisionsMode: Single"
+                echo "    registries:"
+                echo "      - server: $REGISTRY_SERVER"
+                echo "    ingress:"
+                echo "      external: true"
+                echo "      targetPort: 80"
+                echo "      transport: Auto"
+                echo "  template:"
+                echo "    containers:"
+                echo "      - name: siphonbot-app"
+                echo "        image: $FULL_IMAGE"
+                echo "        resources:"
+                echo "          cpu: 0.5"
+                echo "          memory: 1Gi"
+                echo "        env:"
+                echo "          - name: REDDIT_CLIENT_ID"
+                echo "            secretRef: siphonbot-reddit-client-id"
+                echo "          - name: REDDIT_CLIENT_SECRET"
+                echo "            secretRef: siphonbot-reddit-client-secret"
+                echo "          - name: REDDIT_USER_AGENT"
+                echo "            secretRef: siphonbot-reddit-user-agent"
+                echo "          - name: REDDIT_USERNAME"
+                echo "            secretRef: siphonbot-reddit-username"
+                echo "          - name: REDDIT_PASSWORD"
+                echo "            secretRef: siphonbot-reddit-password"
+                echo "          - name: DISCORD_TOKEN"
+                echo "            secretRef: siphonbot-discord-token"
+                echo "          - name: WEBHOOK"
+                echo "            secretRef: siphonbot-discord-webhook"
+                echo "          - name: SERVICE_BUS_CONNECTION_STRING"
+                echo "            secretRef: siphonbot-service-bus-connection"
+                echo "          - name: SERVICE_BUS_QUEUE_NAME"
+                echo "            value: siphon-queue"
+                echo "          - name: MEDIA_TMP_DIR"
+                echo "            value: /tmp/siphon"
+                echo "        volumeMounts:"
+                echo "          - volumeName: ephemeral-downloads"
+                echo "            mountPath: /tmp/siphon"
+                echo "    volumes:"
+                echo "      - name: ephemeral-downloads"
+                echo "        storageType: EmptyDir"
+                echo "    scale:"
+                echo "      minReplicas: 0"
+                echo "      maxReplicas: 1"
+              } > /tmp/containerapp.yaml
               
               # Create container app with YAML template including volumes
               az containerapp create \
