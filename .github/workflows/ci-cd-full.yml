@@ -145,29 +145,29 @@ jobs:
             fi
           fi
 
-        - name: Ensure ACR Pull role assigned to UAI (PowerShell)
-          if: env.USER_ASSIGNED_IDENTITY_ID != ''
-          shell: pwsh
-          run: |
-            Write-Host "Ensuring AcrPull role for UAI: $env:USER_ASSIGNED_IDENTITY_ID"
-            $uaiResourceId = $env:USER_ASSIGNED_IDENTITY_ID
-            if (-not $uaiResourceId) { Write-Host "No UAI configured, skipping"; exit 0 }
-            $acrId = az acr show -n $env:ACR_NAME --query id -o tsv
-            if (-not $acrId) { Write-Host "Unable to resolve ACR id for $env:ACR_NAME"; exit 1 }
-            $principalId = az resource show --ids $uaiResourceId --query properties.principalId -o tsv
-            if (-not $principalId) { Write-Host "Could not get principalId for UAI $uaiResourceId"; exit 1 }
-            if (Get-Command New-AzRoleAssignment -ErrorAction SilentlyContinue) {
-              try {
-                New-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "AcrPull" -Scope $acrId -ErrorAction Stop
-                Write-Host "Assigned AcrPull via New-AzRoleAssignment"
-              } catch {
-                Write-Host "New-AzRoleAssignment failed: $_. Trying az CLI fallback"
-                az role assignment create --assignee-object-id $principalId --role AcrPull --scope $acrId || true
-              }
-            } else {
+      - name: Ensure ACR Pull role assigned to UAI (PowerShell)
+        if: env.USER_ASSIGNED_IDENTITY_ID != ''
+        shell: pwsh
+        run: |
+          Write-Host "Ensuring AcrPull role for UAI: $env:USER_ASSIGNED_IDENTITY_ID"
+          $uaiResourceId = $env:USER_ASSIGNED_IDENTITY_ID
+          if (-not $uaiResourceId) { Write-Host "No UAI configured, skipping"; exit 0 }
+          $acrId = az acr show -n $env:ACR_NAME --query id -o tsv
+          if (-not $acrId) { Write-Host "Unable to resolve ACR id for $env:ACR_NAME"; exit 1 }
+          $principalId = az resource show --ids $uaiResourceId --query properties.principalId -o tsv
+          if (-not $principalId) { Write-Host "Could not get principalId for UAI $uaiResourceId"; exit 1 }
+          if (Get-Command New-AzRoleAssignment -ErrorAction SilentlyContinue) {
+            try {
+              New-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "AcrPull" -Scope $acrId -ErrorAction Stop
+              Write-Host "Assigned AcrPull via New-AzRoleAssignment"
+            } catch {
+              Write-Host "New-AzRoleAssignment failed: $_. Trying az CLI fallback"
               az role assignment create --assignee-object-id $principalId --role AcrPull --scope $acrId || true
-              Write-Host "Assigned AcrPull via az CLI fallback"
             }
+          } else {
+            az role assignment create --assignee-object-id $principalId --role AcrPull --scope $acrId || true
+            Write-Host "Assigned AcrPull via az CLI fallback"
+          }
 
       - name: Expose function keyvault secrets to env
         run: |
@@ -189,31 +189,24 @@ jobs:
             # assign UAI before updating image to ensure pull permission is available
             if [ -n "${USER_ASSIGNED_IDENTITY_ID:-}" ]; then
               echo "Assigning UAI to container app before update"
-              az containerapp identity assign -g $RG -n $APP --identities "$USER_ASSIGNED_IDENTITY_ID" || true
+              az containerapp identity assign -g $RG -n $APP --user-assigned "$USER_ASSIGNED_IDENTITY_ID" || true
             fi
             az containerapp update -g $RG -n $APP --image "$FULL_IMAGE"
           else
+            # Create container app first, then assign identity
+            az containerapp create \
+              --resource-group "$RG" \
+              --name "$APP" \
+              --environment "$ENV_ID" \
+              --image "$FULL_IMAGE" \
+              --ingress 'external' \
+              --target-port 80 \
+              --min-replicas 0 \
+              --max-replicas 1
+            # Assign UAI after creation if provided
             if [ -n "${USER_ASSIGNED_IDENTITY_ID:-}" ]; then
-              az containerapp create \
-                --resource-group "$RG" \
-                --name "$APP" \
-                --environment "$ENV_ID" \
-                --image "$FULL_IMAGE" \
-                --ingress 'external' \
-                --target-port 80 \
-                --min-replicas 0 \
-                --max-replicas 1 \
-                --assign-identity "$USER_ASSIGNED_IDENTITY_ID"
-            else
-              az containerapp create \
-                --resource-group "$RG" \
-                --name "$APP" \
-                --environment "$ENV_ID" \
-                --image "$FULL_IMAGE" \
-                --ingress 'external' \
-                --target-port 80 \
-                --min-replicas 0 \
-                --max-replicas 1
+              echo "Assigning UAI to newly created container app"
+              az containerapp identity assign -g $RG -n $APP --user-assigned "$USER_ASSIGNED_IDENTITY_ID" || true
             fi
           fi
 
