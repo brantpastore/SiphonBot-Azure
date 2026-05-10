@@ -114,6 +114,9 @@ class MediaHandler:
             "noplaylist": True,
             # bgutil PO token provider for YouTube bot-check bypass (script mode)
             "extractor_args": {
+                "youtube": {
+                    "player_client": ["mweb"],
+                },
                 "youtubepot-bgutilscript": {
                     "server_home": ["/opt/bgutil-ytdlp-pot-provider/server"]
                 }
