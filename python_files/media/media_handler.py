@@ -97,6 +97,7 @@ class OversizeView(View):
 class MediaHandler:
     def __init__(self):
         self._info_cache: dict[str, tuple[float, dict]] = {}
+        self._youtube_client_cache: dict[str, str] = {}
         self._cache_ttl_seconds = int(os.getenv("MEDIA_INFO_CACHE_TTL_SECONDS", "600"))
 
     @staticmethod
@@ -108,10 +109,10 @@ class MediaHandler:
             return "twitter"
         return "generic"
 
-    def _build_base_ydl_opts(self) -> dict:
-        debug_mode = os.environ.get("LOG_LEVEL", "INFO").upper() == "DEBUG"
+    def _build_base_ydl_opts(self, youtube_client: str = "mweb", force_debug: bool = False) -> dict:
+        debug_mode = force_debug or os.environ.get("LOG_LEVEL", "INFO").upper() == "DEBUG"
         youtube_args = {
-            "player_client": ["mweb"],
+            "player_client": [youtube_client],
         }
         if debug_mode:
             youtube_args["pot_trace"] = ["true"]
@@ -133,10 +134,11 @@ class MediaHandler:
         if cookie_file:
             opts["cookiefile"] = cookie_file
         logger.debug(
-            "yt-dlp base opts prepared (debug_mode=%s, yt_dlp_version=%s, cookiefile=%s, extractor_args=%s)",
+            "yt-dlp base opts prepared (debug_mode=%s, yt_dlp_version=%s, cookiefile=%s, youtube_client=%s, extractor_args=%s)",
             debug_mode,
             yt_dlp_version.__version__,
             cookie_file or "<unset>",
+            youtube_client,
             {
                 "youtube": youtube_args,
                 "youtubepot-bgutilscript": {
@@ -145,6 +147,11 @@ class MediaHandler:
             },
         )
         return opts
+
+    @staticmethod
+    def _is_youtube_bot_check_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return "sign in to confirm you" in msg and "not a bot" in msg
 
     def _get_cached_info(self, url: str):
         cached = self._info_cache.get(url)
@@ -560,25 +567,50 @@ class MediaHandler:
         if cached is not None:
             return cached
 
-        opts = self._build_base_ydl_opts()
-        opts["skip_download"] = True
-        logger.info(
-            "Starting yt-dlp info extraction for %s (debug=%s, yt-dlp=%s, yt_dlp_plugin=%s, cookiefile=%s)",
-            url,
-            os.environ.get("LOG_LEVEL", "INFO").upper() == "DEBUG",
-            yt_dlp_version.__version__,
-            "bgutil-ytdlp-pot-provider",
-            opts.get("cookiefile", "<unset>"),
-        )
+        # Try mweb first (PO-token preferred path), then web_safari as fallback.
+        candidate_clients = ["mweb", "web_safari"] if self._domain_kind(url) == "youtube" else ["mweb"]
+
         loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(None, lambda: self._yt_extract(url, opts))
+        last_exc = None
+        info = None
+        chosen_client = "mweb"
+        for idx, client in enumerate(candidate_clients):
+            force_debug = idx > 0
+            opts = self._build_base_ydl_opts(youtube_client=client, force_debug=force_debug)
+            opts["skip_download"] = True
+            logger.info(
+                "Starting yt-dlp info extraction for %s (client=%s, debug=%s, yt-dlp=%s, yt_dlp_plugin=%s, cookiefile=%s)",
+                url,
+                client,
+                force_debug or os.environ.get("LOG_LEVEL", "INFO").upper() == "DEBUG",
+                yt_dlp_version.__version__,
+                "bgutil-ytdlp-pot-provider",
+                opts.get("cookiefile", "<unset>"),
+            )
+            try:
+                info = await loop.run_in_executor(None, lambda: self._yt_extract(url, opts))
+                chosen_client = client
+                break
+            except Exception as exc:
+                last_exc = exc
+                if client != "mweb" or not self._is_youtube_bot_check_error(exc):
+                    raise
+                logger.warning(
+                    "YouTube bot-check encountered with client=%s; retrying with client=web_safari",
+                    client,
+                )
+
+        if info is None and last_exc is not None:
+            raise last_exc
+
         if info is not None:
             self._set_cached_info(url, info)
+            self._youtube_client_cache[url] = chosen_client
         return info
 
     MERGE_DOMAINS = ["youtube.com", "youtu.be"]
 
-    async def _download(self, url, output_path, format_str=None, upload_limit=None):
+    async def _download(self, url, output_path, format_str=None, upload_limit=None, youtube_client=None):
         # Use consistent 1MB headroom (issue 17: was mixing 1MB vs 5MB)
         limit_bytes = (upload_limit or MAX_UPLOAD_BYTES) - (1 * 1024 * 1024)
         limit_mb = limit_bytes // (1024 * 1024)
@@ -586,24 +618,47 @@ class MediaHandler:
             fmt = format_str
         else:
             fmt = self._format_selector(url, limit_mb)
-        opts = self._build_base_ydl_opts()
-        opts.update(
-            {
-                "format": fmt,
-                "merge_output_format": "mp4",
-                "outtmpl": output_path,
-            }
-        )
-        logger.info(
-            "Starting yt-dlp download for %s (format=%s, debug=%s, yt-dlp=%s, yt_dlp_plugin=%s)",
-            url,
-            fmt,
-            os.environ.get("LOG_LEVEL", "INFO").upper() == "DEBUG",
-            yt_dlp_version.__version__,
-            "bgutil-ytdlp-pot-provider",
-        )
+        default_client = youtube_client or self._youtube_client_cache.get(url, "mweb")
+        candidate_clients = [default_client]
+        if self._domain_kind(url) == "youtube" and default_client != "web_safari":
+            candidate_clients.append("web_safari")
+
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lambda: self._yt_download(url, opts))
+        last_exc = None
+        for idx, client in enumerate(candidate_clients):
+            force_debug = idx > 0
+            opts = self._build_base_ydl_opts(youtube_client=client, force_debug=force_debug)
+            opts.update(
+                {
+                    "format": fmt,
+                    "merge_output_format": "mp4",
+                    "outtmpl": output_path,
+                }
+            )
+            logger.info(
+                "Starting yt-dlp download for %s (client=%s, format=%s, debug=%s, yt-dlp=%s, yt_dlp_plugin=%s)",
+                url,
+                client,
+                fmt,
+                force_debug or os.environ.get("LOG_LEVEL", "INFO").upper() == "DEBUG",
+                yt_dlp_version.__version__,
+                "bgutil-ytdlp-pot-provider",
+            )
+            try:
+                await loop.run_in_executor(None, lambda: self._yt_download(url, opts))
+                self._youtube_client_cache[url] = client
+                return
+            except Exception as exc:
+                last_exc = exc
+                if client != default_client or not self._is_youtube_bot_check_error(exc):
+                    raise
+                logger.warning(
+                    "YouTube bot-check encountered during download with client=%s; retrying with client=web_safari",
+                    client,
+                )
+
+        if last_exc is not None:
+            raise last_exc
 
     async def _download_hls_remux(self, manifest_url: str, output_path: str):
         cmd = [
