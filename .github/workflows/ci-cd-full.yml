@@ -444,8 +444,7 @@ jobs:
               siphonbot-reddit-password="${{ secrets.REDDIT_PASSWORD }}" \
               siphonbot-discord-token="${{ secrets.DISCORD_TOKEN }}" \
               siphonbot-discord-webhook="${{ secrets.WEBHOOK }}" \
-              siphonbot-service-bus-connection="${SERVICE_BUS_CONN}" \
-              siphonbot-ytdlp-cookies="${{ secrets.YTDLP_COOKIES || '' }}"
+              siphonbot-service-bus-connection="${SERVICE_BUS_CONN}"
 
             az containerapp update -g $RG -n $APP --image "$FULL_IMAGE" \
               --min-replicas 1 --max-replicas 1 \
@@ -458,8 +457,6 @@ jobs:
                 DISCORD_TOKEN="secretref:siphonbot-discord-token" \
                 WEBHOOK="secretref:siphonbot-discord-webhook" \
                 SERVICE_BUS_CONNECTION_STRING="secretref:siphonbot-service-bus-connection" \
-                YTDLP_COOKIES="secretref:siphonbot-ytdlp-cookies" \
-                YTDLP_COOKIES_FILE="/tmp/siphon/yt_cookies.txt" \
                 SERVICE_BUS_QUEUE_NAME="siphon-queue" \
                 MEDIA_TMP_DIR="/tmp/siphon" \
                 AZURE_SUBSCRIPTION_ID="${AZURE_SUBSCRIPTION_ID}" \
@@ -508,10 +505,6 @@ jobs:
                 echo "            secretRef: siphonbot-discord-webhook"
                 echo "          - name: SERVICE_BUS_CONNECTION_STRING"
                 echo "            secretRef: siphonbot-service-bus-connection"
-                echo "          - name: YTDLP_COOKIES"
-                echo "            secretRef: siphonbot-ytdlp-cookies"
-                echo "          - name: YTDLP_COOKIES_FILE"
-                echo "            value: /tmp/siphon/yt_cookies.txt"
                 echo "          - name: SERVICE_BUS_QUEUE_NAME"
                 echo "            value: siphon-queue"
                 echo "          - name: MEDIA_TMP_DIR"
@@ -548,7 +541,6 @@ jobs:
                   siphonbot-discord-token="${{ secrets.DISCORD_TOKEN }}" \
                   siphonbot-discord-webhook="${{ secrets.WEBHOOK }}" \
                   siphonbot-service-bus-connection="${SERVICE_BUS_CONN}" \
-                  siphonbot-ytdlp-cookies="${{ secrets.YTDLP_COOKIES || '' }}" \
                 --yaml /tmp/containerapp.yaml
               rm -f /tmp/containerapp.yaml
             else
@@ -587,10 +579,6 @@ jobs:
                 echo "            secretRef: siphonbot-discord-webhook"
                 echo "          - name: SERVICE_BUS_CONNECTION_STRING"
                 echo "            secretRef: siphonbot-service-bus-connection"
-                echo "          - name: YTDLP_COOKIES"
-                echo "            secretRef: siphonbot-ytdlp-cookies"
-                echo "          - name: YTDLP_COOKIES_FILE"
-                echo "            value: /tmp/siphon/yt_cookies.txt"
                 echo "          - name: SERVICE_BUS_QUEUE_NAME"
                 echo "            value: siphon-queue"
                 echo "          - name: MEDIA_TMP_DIR"
@@ -625,7 +613,6 @@ jobs:
                   siphonbot-discord-token="${{ secrets.DISCORD_TOKEN }}" \
                   siphonbot-discord-webhook="${{ secrets.WEBHOOK }}" \
                   siphonbot-service-bus-connection="${SERVICE_BUS_CONN}" \
-                  siphonbot-ytdlp-cookies="${{ secrets.YTDLP_COOKIES || '' }}" \
                 --yaml /tmp/containerapp.yaml
               rm -f /tmp/containerapp.yaml
             fi
