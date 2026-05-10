@@ -680,25 +680,44 @@ jobs:
           ATTEMPTS=18
           SLEEP_SECONDS=10
 
+          # Capture the revision this CI run deployed so we can detect if a concurrent
+          # run has superseded it mid-health-check (race condition with minReplicas=0).
+          DEPLOYED_REVISION=$(az containerapp show -g "$RG" -n "$APP" --query properties.latestRevisionName -o tsv 2>/dev/null || true)
+          echo "Deployed revision for this run: $DEPLOYED_REVISION"
+
           for i in $(seq 1 "$ATTEMPTS"); do
             PROVISIONING_STATE=$(az containerapp show -g "$RG" -n "$APP" --query properties.provisioningState -o tsv 2>/dev/null || true)
             RUNNING_STATUS=$(az containerapp show -g "$RG" -n "$APP" --query properties.runningStatus -o tsv 2>/dev/null || true)
             LATEST_REVISION=$(az containerapp show -g "$RG" -n "$APP" --query properties.latestRevisionName -o tsv 2>/dev/null || true)
             LATEST_READY_REVISION=$(az containerapp show -g "$RG" -n "$APP" --query properties.latestReadyRevisionName -o tsv 2>/dev/null || true)
-            REV_RUNNING_STATE=$(az containerapp revision show -g "$RG" -n "$APP" --revision "$LATEST_REVISION" --query properties.runningState -o tsv 2>/dev/null || true)
-            REV_HEALTH_STATE=$(az containerapp revision show -g "$RG" -n "$APP" --revision "$LATEST_REVISION" --query properties.healthState -o tsv 2>/dev/null || true)
-            REV_TRAFFIC=$(az containerapp revision show -g "$RG" -n "$APP" --revision "$LATEST_REVISION" --query properties.trafficWeight -o tsv 2>/dev/null || true)
 
-            echo "Attempt $i/$ATTEMPTS: provisioningState=$PROVISIONING_STATE runningStatus=$RUNNING_STATUS latestRevision=$LATEST_REVISION latestReadyRevision=$LATEST_READY_REVISION revRunningState=$REV_RUNNING_STATE revHealthState=$REV_HEALTH_STATE revTrafficWeight=$REV_TRAFFIC"
+            # Find the revision that currently holds 100% traffic — this may differ from
+            # latestRevisionName if a concurrent CI run has already promoted a newer revision.
+            TRAFFIC_REVISION=$(az containerapp revision list -g "$RG" -n "$APP" \
+              --query "[?properties.trafficWeight==\`100\`].name | [0]" -o tsv 2>/dev/null || true)
+            CHECK_REVISION="${TRAFFIC_REVISION:-$LATEST_REVISION}"
+
+            REV_RUNNING_STATE=$(az containerapp revision show -g "$RG" -n "$APP" --revision "$CHECK_REVISION" --query properties.runningState -o tsv 2>/dev/null || true)
+            REV_HEALTH_STATE=$(az containerapp revision show -g "$RG" -n "$APP" --revision "$CHECK_REVISION" --query properties.healthState -o tsv 2>/dev/null || true)
+            REV_TRAFFIC=$(az containerapp revision show -g "$RG" -n "$APP" --revision "$CHECK_REVISION" --query properties.trafficWeight -o tsv 2>/dev/null || true)
+
+            echo "Attempt $i/$ATTEMPTS: provisioningState=$PROVISIONING_STATE runningStatus=$RUNNING_STATUS latestRevision=$LATEST_REVISION latestReadyRevision=$LATEST_READY_REVISION checkRevision=$CHECK_REVISION revRunningState=$REV_RUNNING_STATE revHealthState=$REV_HEALTH_STATE revTrafficWeight=$REV_TRAFFIC"
 
             if [ "$PROVISIONING_STATE" = "Succeeded" ] && [ "$RUNNING_STATUS" = "Running" ] && [ "$REV_RUNNING_STATE" = "Running" ]; then
-              echo "Container App health check passed."
+              echo "Container App health check passed (active revision: $CHECK_REVISION)."
+              exit 0
+            fi
+
+            # If a concurrent CI run has promoted a newer revision that is already Running,
+            # treat this as a pass — our revision was superseded, not broken.
+            if [ -n "$TRAFFIC_REVISION" ] && [ "$TRAFFIC_REVISION" != "$DEPLOYED_REVISION" ] && [ "$REV_RUNNING_STATE" = "Running" ]; then
+              echo "Revision $DEPLOYED_REVISION was superseded by $TRAFFIC_REVISION which is Running. Health check passed."
               exit 0
             fi
 
             if [ "$REV_RUNNING_STATE" = "ActivationFailed" ] || [ "$REV_HEALTH_STATE" = "Unhealthy" ]; then
-              echo "Latest revision failed activation/health checks. Dumping revision logs..."
-              az containerapp logs show -g "$RG" -n "$APP" --revision "$LATEST_REVISION" --tail 200 || true
+              echo "Active revision ($CHECK_REVISION) failed activation/health checks. Dumping revision logs..."
+              az containerapp logs show -g "$RG" -n "$APP" --revision "$CHECK_REVISION" --tail 200 || true
               break
             fi
 
