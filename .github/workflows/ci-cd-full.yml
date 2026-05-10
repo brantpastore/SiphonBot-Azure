@@ -378,11 +378,55 @@ jobs:
                   template.containers[0].volumeMounts[0].volumeName=ephemeral-downloads \
                   template.containers[0].volumeMounts[0].mountPath=/tmp/siphon
 
-          echo "Ensuring Container App is started when possible..."
+  start-container-app:
+    runs-on: ubuntu-latest
+    needs: deploy
+    env:
+      RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+      CONTAINERAPP_NAME: ${{ vars.CONTAINERAPP_NAME }}
+    steps:
+      - name: Login to Azure (prefer OIDC if configured)
+        uses: azure/login@v1
+        with:
+          auth-type: service_principal
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Start Container App if stopped
+        run: |
+          RG="${RESOURCE_GROUP}"
+          APP="${CONTAINERAPP_NAME}"
+
           RUNNING_STATUS=$(az containerapp show -g "$RG" -n "$APP" --query properties.runningStatus -o tsv 2>/dev/null || true)
           if [ "$RUNNING_STATUS" = "Stopped" ]; then
+            echo "Container App is stopped; starting now..."
             az containerapp start -g "$RG" -n "$APP"
           else
             echo "Container App runningStatus is '$RUNNING_STATUS' (no explicit start needed)."
           fi
+
+      - name: Health check Container App
+        run: |
+          RG="${RESOURCE_GROUP}"
+          APP="${CONTAINERAPP_NAME}"
+
+          ATTEMPTS=18
+          SLEEP_SECONDS=10
+
+          for i in $(seq 1 "$ATTEMPTS"); do
+            PROVISIONING_STATE=$(az containerapp show -g "$RG" -n "$APP" --query properties.provisioningState -o tsv 2>/dev/null || true)
+            RUNNING_STATUS=$(az containerapp show -g "$RG" -n "$APP" --query properties.runningStatus -o tsv 2>/dev/null || true)
+            LATEST_REVISION=$(az containerapp show -g "$RG" -n "$APP" --query properties.latestReadyRevisionName -o tsv 2>/dev/null || true)
+
+            echo "Attempt $i/$ATTEMPTS: provisioningState=$PROVISIONING_STATE runningStatus=$RUNNING_STATUS latestReadyRevision=$LATEST_REVISION"
+
+            if [ "$PROVISIONING_STATE" = "Succeeded" ] && [ "$RUNNING_STATUS" = "Running" ]; then
+              echo "Container App health check passed."
+              exit 0
+            fi
+
+            sleep "$SLEEP_SECONDS"
+          done
+
+          echo "Container App health check failed after $ATTEMPTS attempts."
+          az containerapp show -g "$RG" -n "$APP" -o jsonc || true
+          exit 1
 
