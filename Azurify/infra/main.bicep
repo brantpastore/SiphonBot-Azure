@@ -203,6 +203,20 @@ resource acrPullAssignment 'Microsoft.Authorization/roleAssignments@2020-10-01-p
 output userAssignedIdentityId string = uai.id
 output userAssignedIdentityPrincipalId string = uai.properties.principalId
 
+@description('Optional: principal id of an existing container app to grant AcrPull for (leave empty to skip)')
+param containerAppPrincipalId string = ''
+
+// Conditional role assignment to grant AcrPull to a container app principal (useful when container app is created outside this Bicep)
+resource containerAppAcrPull 'Microsoft.Authorization/roleAssignments@2020-10-01-preview' = if (containerAppPrincipalId != '') {
+  name: guid(acr.id, containerAppPrincipalId, 'containerAppAcr')
+  properties: {
+    roleDefinitionId: acrPullRoleDef
+    principalId: containerAppPrincipalId
+    principalType: 'ServicePrincipal'
+  }
+  scope: acr
+}
+
 // Grant the user-assigned identity access to Blob Storage (Storage Blob Data Contributor)
 // GUID corresponds to the built-in 'Storage Blob Data Contributor' role.
 var storageBlobDataContributor = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')

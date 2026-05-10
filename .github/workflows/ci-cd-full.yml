@@ -46,6 +46,7 @@ jobs:
         with:
           auth-type: service_principal
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+          enable-AzPSSession: true
       - name: Debug Azure login
         run: |
           echo "--- az account show ---"
@@ -144,6 +145,30 @@ jobs:
             fi
           fi
 
+        - name: Ensure ACR Pull role assigned to UAI (PowerShell)
+          if: env.USER_ASSIGNED_IDENTITY_ID != ''
+          shell: pwsh
+          run: |
+            Write-Host "Ensuring AcrPull role for UAI: $env:USER_ASSIGNED_IDENTITY_ID"
+            $uaiResourceId = $env:USER_ASSIGNED_IDENTITY_ID
+            if (-not $uaiResourceId) { Write-Host "No UAI configured, skipping"; exit 0 }
+            $acrId = az acr show -n $env:ACR_NAME --query id -o tsv
+            if (-not $acrId) { Write-Host "Unable to resolve ACR id for $env:ACR_NAME"; exit 1 }
+            $principalId = az resource show --ids $uaiResourceId --query properties.principalId -o tsv
+            if (-not $principalId) { Write-Host "Could not get principalId for UAI $uaiResourceId"; exit 1 }
+            if (Get-Command New-AzRoleAssignment -ErrorAction SilentlyContinue) {
+              try {
+                New-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "AcrPull" -Scope $acrId -ErrorAction Stop
+                Write-Host "Assigned AcrPull via New-AzRoleAssignment"
+              } catch {
+                Write-Host "New-AzRoleAssignment failed: $_. Trying az CLI fallback"
+                az role assignment create --assignee-object-id $principalId --role AcrPull --scope $acrId || true
+              }
+            } else {
+              az role assignment create --assignee-object-id $principalId --role AcrPull --scope $acrId || true
+              Write-Host "Assigned AcrPull via az CLI fallback"
+            }
+
       - name: Expose function keyvault secrets to env
         run: |
           echo "FUNCTION_KEYVAULT_SECRETS=${{ secrets.FUNCTION_KEYVAULT_SECRETS }}" >> $GITHUB_ENV
@@ -158,14 +183,15 @@ jobs:
           echo "Using FULL_IMAGE=$FULL_IMAGE"
           if [ -z "$ENV_ID" ]; then echo "Container Apps environment ID not found. Ensure Bicep created the env."; exit 1; fi
 
-          # If app exists, update image; otherwise create.
+          # If app exists, ensure UAI is assigned (so it can pull) then update image; otherwise create.
           exists=$(az containerapp show -g $RG -n $APP --query name -o tsv || true)
           if [ -n "$exists" ]; then
-            az containerapp update -g $RG -n $APP --image "$FULL_IMAGE"
-            # Assign the user-assigned identity so the container app can access Key Vault and ACR
+            # assign UAI before updating image to ensure pull permission is available
             if [ -n "${USER_ASSIGNED_IDENTITY_ID:-}" ]; then
+              echo "Assigning UAI to container app before update"
               az containerapp identity assign -g $RG -n $APP --identities "$USER_ASSIGNED_IDENTITY_ID" || true
             fi
+            az containerapp update -g $RG -n $APP --image "$FULL_IMAGE"
           else
             if [ -n "${USER_ASSIGNED_IDENTITY_ID:-}" ]; then
               az containerapp create \
