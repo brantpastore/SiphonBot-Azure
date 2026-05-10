@@ -29,4 +29,6 @@ COPY python_files /usr/src/app/python_files
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-CMD ["/bin/sh", "-c", "pip install --upgrade yt-dlp --quiet && python python_files/main.py"]
+# Keep the runtime deterministic so the bundled yt-dlp plugin stays aligned with the
+# yt-dlp version installed during the image build.
+CMD ["python", "python_files/main.py"]
