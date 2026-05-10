@@ -103,6 +103,11 @@ jobs:
           
           # Build settings array and set them all at once
           # Only set storage if we have a connection string
+          # NOTE: WEBSITE_RUN_FROM_PACKAGE is intentionally NOT set here.
+          # The 'az functionapp deployment source config-zip' command sets it to
+          # the correct blob SAS URL automatically. Setting it to '1' here would
+          # put the runtime into a broken "run from local package" state before
+          # the zip is uploaded, causing sync_function_triggers to fail.
           if [ -n "$STORAGE_CONN_STR" ]; then
             az functionapp config appsettings set \
               --name "$APP" \
@@ -112,7 +117,6 @@ jobs:
                 SERVICE_BUS_CONNECTION_STRING="$SB_CONN_STR" \
                 FUNCTIONS_EXTENSION_VERSION=~4 \
                 FUNCTIONS_WORKER_RUNTIME=python \
-                WEBSITE_RUN_FROM_PACKAGE=1 \
                 SERVICE_BUS_QUEUE_NAME=siphon-queue
             echo "✓ Function App settings configured with storage and Service Bus"
           else
@@ -124,7 +128,6 @@ jobs:
                 SERVICE_BUS_CONNECTION_STRING="$SB_CONN_STR" \
                 FUNCTIONS_EXTENSION_VERSION=~4 \
                 FUNCTIONS_WORKER_RUNTIME=python \
-                WEBSITE_RUN_FROM_PACKAGE=1 \
                 SERVICE_BUS_QUEUE_NAME=siphon-queue
             echo "⚠ Function App settings configured (no storage connection string)"
           fi
