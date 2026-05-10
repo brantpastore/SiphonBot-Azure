@@ -250,6 +250,9 @@ jobs:
             siphonbot-discord-webhook="${{ secrets.WEBHOOK }}" \
             siphonbot-service-bus-connection="${{ secrets.SERVICE_BUS_CONNECTION_STRING }}"
 
+          echo "Restarting Container App so secret changes take effect..."
+          az containerapp revision restart -g "$RG" -n "$APP" --revision "$(az containerapp show -g "$RG" -n "$APP" --query properties.latestRevisionName -o tsv)" || true
+
       - name: Create or update Container App
         run: |
           # Prefer runtime FULL_IMAGE (set earlier via GITHUB_ENV), otherwise use the build job output
@@ -291,7 +294,7 @@ jobs:
               siphonbot-service-bus-connection="${{ secrets.SERVICE_BUS_CONNECTION_STRING }}"
 
             az containerapp update -g $RG -n $APP --image "$FULL_IMAGE" \
-              --env-vars \
+              --set-env-vars \
                 REDDIT_CLIENT_ID="secretref:siphonbot-reddit-client-id" \
                 REDDIT_CLIENT_SECRET="secretref:siphonbot-reddit-client-secret" \
                 REDDIT_USER_AGENT="secretref:siphonbot-reddit-user-agent" \
