@@ -1,7 +1,20 @@
 import os
 import logging
+import sys
 
 logger = logging.getLogger(__name__)
+
+# Set to True for extra detail in logs (env var LOG_LEVEL=DEBUG also enables this).
+_VERBOSE = os.environ.get("LOG_LEVEL", "").upper() == "DEBUG"
+
+# Required keys — startup will fail fast if any of these are missing/empty.
+_REQUIRED_KEYS = [
+    "DISCORD_TOKEN",
+    "REDDIT_CLIENT_ID",
+    "REDDIT_CLIENT_SECRET",
+    "REDDIT_USERNAME",
+    "REDDIT_PASSWORD",
+]
 
 # Maps Container App secret names → config variable names.
 # These names correspond to what the CI/CD pipeline stores via `az containerapp secret set`.
@@ -33,15 +46,28 @@ def _fetch_from_container_app() -> dict[str, str] | None:
     resource_group = os.environ.get("AZURE_RESOURCE_GROUP")
     container_app_name = os.environ.get("CONTAINER_APP_NAME")  # auto-set by Container Apps
 
+    logger.info(
+        "[startup] Azure context: subscription_id=%s resource_group=%s container_app_name=%s",
+        subscription_id or "<not set>",
+        resource_group or "<not set>",
+        container_app_name or "<not set>",
+    )
+
     if not all([subscription_id, resource_group, container_app_name]):
+        logger.info(
+            "[startup] One or more Azure context vars missing — skipping Container App secret fetch "
+            "(running locally or vars not injected). Will fall back to env vars."
+        )
         return None
 
     try:
         import requests
         from azure.identity import DefaultAzureCredential
 
+        logger.info("[startup] Acquiring Managed Identity token for Azure management API...")
         credential = DefaultAzureCredential()
         token = credential.get_token("https://management.azure.com/.default").token
+        logger.info("[startup] Token acquired successfully.")
 
         url = (
             f"https://management.azure.com/subscriptions/{subscription_id}"
@@ -49,27 +75,68 @@ def _fetch_from_container_app() -> dict[str, str] | None:
             f"/providers/Microsoft.App/containerApps/{container_app_name}"
             f"/listSecrets?api-version=2024-03-01"
         )
+        logger.info("[startup] Calling Container App listSecrets API: %s", url)
         resp = requests.post(
             url,
             headers={"Authorization": f"Bearer {token}"},
             timeout=10,
         )
+        logger.info("[startup] listSecrets HTTP response: %s", resp.status_code)
         resp.raise_for_status()
 
-        fetched: dict[str, str] = {}
-        for secret in resp.json().get("value", []):
-            var_name = _SECRET_MAP.get(secret.get("name", ""))
-            if var_name:
-                fetched[var_name] = secret.get("value", "")
+        raw_secrets = resp.json().get("value", [])
+        logger.info("[startup] API returned %d raw secret entries.", len(raw_secrets))
 
-        logger.info("Fetched %d secrets from Container App API.", len(fetched))
+        fetched: dict[str, str] = {}
+        for secret in raw_secrets:
+            secret_name = secret.get("name", "")
+            var_name = _SECRET_MAP.get(secret_name)
+            value = secret.get("value", "")
+            if var_name:
+                fetched[var_name] = value
+                if _VERBOSE:
+                    masked = (value[:4] + "****") if value else "<empty>"
+                    logger.debug(
+                        "[startup] Mapped secret '%s' → %s = %s",
+                        secret_name, var_name, masked,
+                    )
+            else:
+                logger.debug("[startup] Unknown secret name '%s' — ignored.", secret_name)
+
+        present = [k for k, v in fetched.items() if v]
+        missing = [k for k, v in fetched.items() if not v]
+        logger.info(
+            "[startup] Fetched %d secrets from Container App API. Present: %s. Empty: %s.",
+            len(fetched), present, missing or "none",
+        )
         return fetched
 
     except Exception as exc:
         logger.warning(
-            "Could not fetch secrets from Container App API (%s); falling back to env vars.", exc
+            "[startup] Could not fetch secrets from Container App API (%s: %s); "
+            "falling back to env vars.",
+            type(exc).__name__, exc,
         )
         return None
+
+
+def _preflight_check(config: dict[str, str]) -> None:
+    """
+    Validate that all required config keys are present and non-empty.
+    Logs a clear error and raises SystemExit so the container fails fast
+    with a human-readable message instead of a cryptic downstream TypeError.
+    """
+    missing = [k for k in _REQUIRED_KEYS if not config.get(k)]
+    if missing:
+        logger.error(
+            "[startup] PREFLIGHT FAILED — the following required config keys are "
+            "missing or empty: %s. Check that Container App secrets are set and the "
+            "Managed Identity has 'Contributor' role on the Container App resource, "
+            "or that the corresponding environment variables are set for local dev.",
+            missing,
+        )
+        sys.exit(1)
+    logger.info("[startup] Preflight check passed. All required config keys are present.")
 
 
 def load_env_variables() -> dict[str, str]:
@@ -80,15 +147,28 @@ def load_env_variables() -> dict[str, str]:
     App secrets store via Managed Identity.  Otherwise (local dev), values are
     read directly from environment variables.
     """
+    logger.info(
+        "[startup] load_env_variables called. LOG_LEVEL=%s verbose=%s",
+        os.environ.get("LOG_LEVEL", "<not set>"), _VERBOSE,
+    )
+
     azure_secrets = _fetch_from_container_app()
+
+    source = "Container App API" if azure_secrets is not None else "environment variables"
+    logger.info("[startup] Secret source: %s", source)
 
     def get(key: str, default: str = "") -> str:
         # Prefer the value from the Container App API; fall back to env var.
         if azure_secrets is not None:
-            return azure_secrets.get(key) or os.environ.get(key, default)
-        return os.environ.get(key, default)
+            val = azure_secrets.get(key) or os.environ.get(key, default)
+        else:
+            val = os.environ.get(key, default)
+        if _VERBOSE:
+            present = "present" if val else "MISSING"
+            logger.debug("[startup] Config key %s: %s", key, present)
+        return val
 
-    return {
+    config = {
         "REDDIT_CLIENT_ID":              get("REDDIT_CLIENT_ID"),
         "REDDIT_CLIENT_SECRET":          get("REDDIT_CLIENT_SECRET"),
         "REDDIT_USER_AGENT":             get("REDDIT_USER_AGENT"),
@@ -99,3 +179,6 @@ def load_env_variables() -> dict[str, str]:
         "SERVICE_BUS_CONNECTION_STRING": get("SERVICE_BUS_CONNECTION_STRING"),
         "SERVICE_BUS_QUEUE_NAME":        os.environ.get("SERVICE_BUS_QUEUE_NAME", "siphon-queue"),
     }
+
+    _preflight_check(config)
+    return config
