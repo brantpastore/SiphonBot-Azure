@@ -110,6 +110,12 @@ class MediaHandler:
 
     def _build_base_ydl_opts(self) -> dict:
         debug_mode = os.environ.get("LOG_LEVEL", "INFO").upper() == "DEBUG"
+        youtube_args = {
+            "player_client": ["mweb"],
+        }
+        if debug_mode:
+            youtube_args["pot_trace"] = ["true"]
+
         opts = {
             "quiet": True,
             "no_warnings": True,
@@ -117,10 +123,7 @@ class MediaHandler:
             "verbose": debug_mode,
             # bgutil PO token provider for YouTube bot-check bypass (script mode)
             "extractor_args": {
-                "youtube": {
-                    "player_client": ["mweb"],
-                    "pot_trace": [debug_mode],
-                },
+                "youtube": youtube_args,
                 "youtubepot-bgutilscript": {
                     "server_home": ["/opt/bgutil-ytdlp-pot-provider/server"]
                 }
@@ -135,10 +138,7 @@ class MediaHandler:
             yt_dlp_version.__version__,
             cookie_file or "<unset>",
             {
-                "youtube": {
-                    "player_client": ["mweb"],
-                    "pot_trace": [debug_mode],
-                },
+                "youtube": youtube_args,
                 "youtubepot-bgutilscript": {
                     "server_home": ["/opt/bgutil-ytdlp-pot-provider/server"],
                 },
