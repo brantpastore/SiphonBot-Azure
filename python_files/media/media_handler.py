@@ -101,6 +101,22 @@ class MediaHandler:
         self._cache_ttl_seconds = int(os.getenv("MEDIA_INFO_CACHE_TTL_SECONDS", "600"))
 
     @staticmethod
+    def _split_csv_env(name: str, default: list[str]) -> list[str]:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return default
+        parts = [item.strip() for item in raw.split(",") if item.strip()]
+        return parts or default
+
+    def _youtube_candidate_clients(self) -> list[str]:
+        clients = self._split_csv_env("YTDLP_YOUTUBE_CLIENTS", ["mweb", "web_safari"])
+        deduped = []
+        for client in clients:
+            if client not in deduped:
+                deduped.append(client)
+        return deduped
+
+    @staticmethod
     def _domain_kind(url: str) -> str:
         lowered = (url or "").lower()
         if any(domain in lowered for domain in ("youtube.com", "youtu.be")):
@@ -117,6 +133,26 @@ class MediaHandler:
         if debug_mode:
             youtube_args["pot_trace"] = ["true"]
 
+        trusted_po_token = os.getenv("YTDLP_YOUTUBE_PO_TOKEN", "").strip()
+        trusted_visitor_data = os.getenv("YTDLP_YOUTUBE_VISITOR_DATA", "").strip()
+        if trusted_po_token:
+            youtube_args["po_token"] = [trusted_po_token]
+        if trusted_visitor_data:
+            youtube_args["visitor_data"] = [trusted_visitor_data]
+
+        extractor_args = {
+            "youtube": youtube_args,
+            "youtubepot-bgutilscript": {
+                "server_home": ["/opt/bgutil-ytdlp-pot-provider/server"]
+            },
+        }
+
+        bgutil_http_base_url = os.getenv("YTDLP_BGUTIL_BASE_URL", "").strip()
+        if bgutil_http_base_url:
+            extractor_args["youtubepot-bgutilhttp"] = {
+                "base_url": [bgutil_http_base_url],
+            }
+
         opts = {
             "quiet": True,
             "no_warnings": True,
@@ -128,27 +164,38 @@ class MediaHandler:
                 "node": {},
             },
             # bgutil PO token provider for YouTube bot-check bypass (script mode)
-            "extractor_args": {
-                "youtube": youtube_args,
-                "youtubepot-bgutilscript": {
-                    "server_home": ["/opt/bgutil-ytdlp-pot-provider/server"]
-                }
-            },
+            "extractor_args": extractor_args,
         }
+
+        proxy_url = os.getenv("YTDLP_PROXY", "").strip()
+        if proxy_url:
+            opts["proxy"] = proxy_url
+
         cookie_file = os.getenv("YTDLP_COOKIES_FILE", "").strip()
         if cookie_file:
             opts["cookiefile"] = cookie_file
+
+        safe_youtube_args = dict(youtube_args)
+        if "po_token" in safe_youtube_args:
+            safe_youtube_args["po_token"] = ["<set>"]
+        if "visitor_data" in safe_youtube_args:
+            safe_youtube_args["visitor_data"] = ["<set>"]
+
         logger.debug(
-            "yt-dlp base opts prepared (debug_mode=%s, yt_dlp_version=%s, cookiefile=%s, youtube_client=%s, extractor_args=%s)",
+            "yt-dlp base opts prepared (debug_mode=%s, yt_dlp_version=%s, cookiefile=%s, youtube_client=%s, proxy=%s, extractor_args=%s)",
             debug_mode,
             yt_dlp_version.__version__,
             cookie_file or "<unset>",
             youtube_client,
+            "<set>" if proxy_url else "<unset>",
             {
-                "youtube": youtube_args,
+                "youtube": safe_youtube_args,
                 "youtubepot-bgutilscript": {
                     "server_home": ["/opt/bgutil-ytdlp-pot-provider/server"],
                 },
+                "youtubepot-bgutilhttp": {
+                    "base_url": ["<set>"]
+                } if bgutil_http_base_url else "<unset>",
             },
         )
         return opts
@@ -300,6 +347,15 @@ class MediaHandler:
 
         except Exception as e:
             logger.exception(f"YouTube download error: {e}\n{traceback.format_exc()}")
+            if self._is_youtube_bot_check_error(e):
+                await safe_followup(
+                    interaction,
+                    "YouTube is still flagging this request as bot traffic. "
+                    "Try setting one or more of: YTDLP_PROXY, YTDLP_COOKIES_FILE, "
+                    "YTDLP_YOUTUBE_PO_TOKEN + YTDLP_YOUTUBE_VISITOR_DATA, or "
+                    "YTDLP_BGUTIL_BASE_URL.",
+                )
+                return
             await safe_followup(interaction, f"Error downloading video: {e}")
         finally:
             cleanup(workdir, filepath)
@@ -572,8 +628,8 @@ class MediaHandler:
         if cached is not None:
             return cached
 
-        # Try mweb first (PO-token preferred path), then web_safari as fallback.
-        candidate_clients = ["mweb", "web_safari"] if self._domain_kind(url) == "youtube" else ["mweb"]
+        # Try configurable client list for YouTube; default remains mweb -> web_safari.
+        candidate_clients = self._youtube_candidate_clients() if self._domain_kind(url) == "youtube" else ["mweb"]
 
         loop = asyncio.get_event_loop()
         last_exc = None
@@ -598,11 +654,13 @@ class MediaHandler:
                 break
             except Exception as exc:
                 last_exc = exc
-                if client != "mweb" or not self._is_youtube_bot_check_error(exc):
+                next_client = candidate_clients[idx + 1] if (idx + 1) < len(candidate_clients) else None
+                if not next_client or not self._is_youtube_bot_check_error(exc):
                     raise
                 logger.warning(
-                    "YouTube bot-check encountered with client=%s; retrying with client=web_safari",
+                    "YouTube bot-check encountered with client=%s; retrying with client=%s",
                     client,
+                    next_client,
                 )
 
         if info is None and last_exc is not None:
@@ -625,8 +683,10 @@ class MediaHandler:
             fmt = self._format_selector(url, limit_mb)
         default_client = youtube_client or self._youtube_client_cache.get(url, "mweb")
         candidate_clients = [default_client]
-        if self._domain_kind(url) == "youtube" and default_client != "web_safari":
-            candidate_clients.append("web_safari")
+        if self._domain_kind(url) == "youtube":
+            for client in self._youtube_candidate_clients():
+                if client not in candidate_clients:
+                    candidate_clients.append(client)
 
         loop = asyncio.get_event_loop()
         last_exc = None
@@ -655,11 +715,13 @@ class MediaHandler:
                 return
             except Exception as exc:
                 last_exc = exc
-                if client != default_client or not self._is_youtube_bot_check_error(exc):
+                next_client = candidate_clients[idx + 1] if (idx + 1) < len(candidate_clients) else None
+                if not next_client or not self._is_youtube_bot_check_error(exc):
                     raise
                 logger.warning(
-                    "YouTube bot-check encountered during download with client=%s; retrying with client=web_safari",
+                    "YouTube bot-check encountered during download with client=%s; retrying with client=%s",
                     client,
+                    next_client,
                 )
 
         if last_exc is not None:
