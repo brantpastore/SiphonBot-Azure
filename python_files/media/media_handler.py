@@ -122,6 +122,11 @@ class MediaHandler:
             "no_warnings": True,
             "noplaylist": True,
             "verbose": debug_mode,
+            # Ensure yt-dlp can execute JavaScript challenge providers with Node.js.
+            # In Azure logs we observed JSC "node (unavailable)" unless this is explicit.
+            "js_runtimes": {
+                "node": {},
+            },
             # bgutil PO token provider for YouTube bot-check bypass (script mode)
             "extractor_args": {
                 "youtube": youtube_args,
