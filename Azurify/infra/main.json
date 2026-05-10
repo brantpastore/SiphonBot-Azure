@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.43.8.12551",
-      "templateHash": "4584209339103364148"
+      "templateHash": "16730860519209474106"
     }
   },
   "parameters": {
@@ -69,34 +69,6 @@
       "defaultValue": "",
       "metadata": {
         "description": "Optional: principal id of an existing container app to grant AcrPull for (leave empty to skip)"
-      }
-    },
-    "containerAppName": {
-      "type": "string",
-      "defaultValue": "siphonbot-app",
-      "metadata": {
-        "description": "Container App name"
-      }
-    },
-    "deployContainerApp": {
-      "type": "bool",
-      "defaultValue": true,
-      "metadata": {
-        "description": "Set true to deploy Container App. Image will be pulled from containerAppImageName in ACR."
-      }
-    },
-    "containerAppImageName": {
-      "type": "string",
-      "defaultValue": "siphonbot",
-      "metadata": {
-        "description": "Container image name in ACR (without registry server or tag)"
-      }
-    },
-    "containerAppImageTag": {
-      "type": "string",
-      "defaultValue": "latest",
-      "metadata": {
-        "description": "Container image tag (default: latest)"
       }
     }
   },
@@ -252,69 +224,6 @@
       ]
     },
     {
-      "condition": "[parameters('deployContainerApp')]",
-      "type": "Microsoft.App/containerApps",
-      "apiVersion": "2023-05-01",
-      "name": "[parameters('containerAppName')]",
-      "location": "[parameters('location')]",
-      "identity": {
-        "type": "UserAssigned",
-        "userAssignedIdentities": {
-          "[format('{0}', resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('siphonbot-uai-{0}', uniqueString(resourceGroup().id))))]": {}
-        }
-      },
-      "properties": {
-        "environmentId": "[resourceId('Microsoft.App/managedEnvironments', format('containerapps-env-{0}', uniqueString(resourceGroup().id)))]",
-        "configuration": {
-          "activeRevisionsMode": "Single",
-          "registries": [
-            {
-              "server": "[reference(resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName')), '2023-07-01').loginServer]",
-              "identity": "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('siphonbot-uai-{0}', uniqueString(resourceGroup().id)))]"
-            }
-          ],
-          "ingress": {
-            "external": true,
-            "targetPort": 80,
-            "transport": "Auto"
-          }
-        },
-        "template": {
-          "containers": [
-            {
-              "name": "[parameters('containerAppName')]",
-              "image": "[format('{0}/{1}:{2}', reference(resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName')), '2023-07-01').loginServer, parameters('containerAppImageName'), parameters('containerAppImageTag'))]",
-              "resources": {
-                "cpu": "[json('0.5')]",
-                "memory": "1Gi"
-              },
-              "volumeMounts": [
-                {
-                  "volumeName": "ephemeral-downloads",
-                  "mountPath": "/tmp/siphon"
-                }
-              ]
-            }
-          ],
-          "volumes": [
-            {
-              "name": "ephemeral-downloads",
-              "storageType": "EmptyDir"
-            }
-          ],
-          "scale": {
-            "minReplicas": 0,
-            "maxReplicas": 1
-          }
-        }
-      },
-      "dependsOn": [
-        "[resourceId('Microsoft.ContainerRegistry/registries', parameters('acrName'))]",
-        "[resourceId('Microsoft.App/managedEnvironments', format('containerapps-env-{0}', uniqueString(resourceGroup().id)))]",
-        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('siphonbot-uai-{0}', uniqueString(resourceGroup().id)))]"
-      ]
-    },
-    {
       "condition": "[parameters('createUaiAcrPullAssignment')]",
       "type": "Microsoft.Authorization/roleAssignments",
       "apiVersion": "2020-10-01-preview",
@@ -386,18 +295,6 @@
     "userAssignedIdentityPrincipalId": {
       "type": "string",
       "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('siphonbot-uai-{0}', uniqueString(resourceGroup().id))), '2018-11-30').principalId]"
-    },
-    "containerAppName": {
-      "type": "string",
-      "value": "[if(parameters('deployContainerApp'), parameters('containerAppName'), '')]"
-    },
-    "containerAppId": {
-      "type": "string",
-      "value": "[if(parameters('deployContainerApp'), resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '')]"
-    },
-    "containerAppFqdn": {
-      "type": "string",
-      "value": "[if(parameters('deployContainerApp'), reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2023-05-01').configuration.ingress.fqdn, '')]"
     },
     "functionAppName": {
       "type": "string",
