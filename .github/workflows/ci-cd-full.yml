@@ -185,6 +185,13 @@ jobs:
           echo "Using REGISTRY_SERVER=$REGISTRY_SERVER"
           if [ -z "$ENV_ID" ]; then echo "Container Apps environment ID not found. Ensure Bicep created the env."; exit 1; fi
 
+          # If app exists but is in Failed provisioning state, delete it so we can recreate cleanly.
+          APP_STATE=$(az containerapp show -g "$RG" -n "$APP" --query properties.provisioningState -o tsv 2>/dev/null || true)
+          if [ "$APP_STATE" = "Failed" ]; then
+            echo "Container App is in Failed state. Deleting $APP before recreate..."
+            az containerapp delete -g "$RG" -n "$APP" --yes
+          fi
+
           # If app exists, ensure UAI is assigned (so it can pull) then update image; otherwise create.
           exists=$(az containerapp show -g $RG -n $APP --query name -o tsv || true)
           if [ -n "$exists" ]; then
