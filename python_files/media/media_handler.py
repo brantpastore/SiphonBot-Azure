@@ -411,7 +411,7 @@ class MediaHandler:
         if format_str:
             fmt = format_str
         elif any(domain in url for domain in self.MERGE_DOMAINS):
-            fmt = f"bestvideo[ext=mp4][filesize<{limit_mb}M]+bestaudio[ext=m4a]/best[ext=mp4][filesize<{limit_mb}M]/best[filesize<{limit_mb}M]"
+            fmt = f"best[ext=mp4][filesize<{limit_mb}M]/best[filesize<{limit_mb}M]/bestvideo[ext=mp4][filesize<{limit_mb}M]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
         else:
             fmt = f"best[filesize<{limit_mb}M]/best"
         opts = {

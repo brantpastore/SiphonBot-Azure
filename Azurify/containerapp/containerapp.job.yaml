@@ -10,8 +10,8 @@ properties:
       - name: siphonbot
         image: "<ACR_LOGIN_SERVER>/<IMAGE_NAME>:<TAG>"
         resources:
-          cpu: 0.5
-          memory: "1Gi"
+          cpu: 1.0
+          memory: "2Gi"
     scale:
       minReplicas: 1
       maxReplicas: 1
