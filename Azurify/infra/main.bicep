@@ -25,18 +25,6 @@ param createUaiAcrPullAssignment bool = true
 @description('Optional: principal id of an existing container app to grant AcrPull for (leave empty to skip)')
 param containerAppPrincipalId string = ''
 
-@description('Container App name')
-param containerAppName string = 'siphonbot-app'
-
-@description('Set true to deploy Container App. Image will be pulled from containerAppImageName in ACR.')
-param deployContainerApp bool = true
-
-@description('Container image name in ACR (without registry server or tag)')
-param containerAppImageName string = 'siphonbot'
-
-@description('Container image tag (default: latest)')
-param containerAppImageTag string = 'latest'
-
 resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
   name: acrName
   location: location
@@ -164,63 +152,6 @@ resource functionApp 'Microsoft.Web/sites@2023-01-01' = if (deployFunctionApp) {
   }
 }
 
-// Container App for Discord bot with ephemeral storage for media downloads
-resource containerApp 'Microsoft.App/containerApps@2023-05-01' = if (deployContainerApp) {
-  name: containerAppName
-  location: location
-  identity: {
-    type: 'UserAssigned'
-    userAssignedIdentities: {
-      '${uai.id}': {}
-    }
-  }
-  properties: {
-    environmentId: containerEnv.id
-    configuration: {
-      activeRevisionsMode: 'Single'
-      registries: [
-        {
-          server: acr.properties.loginServer
-          identity: uai.id
-        }
-      ]
-      ingress: {
-        external: true
-        targetPort: 80
-        transport: 'Auto'
-      }
-    }
-    template: {
-      containers: [
-        {
-          name: containerAppName
-          image: '${acr.properties.loginServer}/${containerAppImageName}:${containerAppImageTag}'
-          resources: {
-            cpu: json('0.5')
-            memory: '1Gi'
-          }
-          volumeMounts: [
-            {
-              volumeName: 'ephemeral-downloads'
-              mountPath: '/tmp/siphon'
-            }
-          ]
-        }
-      ]
-      volumes: [
-        {
-          name: 'ephemeral-downloads'
-          storageType: 'EmptyDir'
-        }
-      ]
-      scale: {
-        minReplicas: 0
-        maxReplicas: 1
-      }
-    }
-  }
-}
-
 // Role assignment to allow identities to pull images from ACR.
 var acrPullRoleDef = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')
 
@@ -254,9 +185,6 @@ output serviceBusQueue string = sbQueue.name
 output serviceBusConnectionString string = listkeys('${sbNamespace.id}/AuthorizationRules/RootManageSharedAccessKey', sbNamespace.apiVersion).primaryConnectionString
 output userAssignedIdentityId string = uai.id
 output userAssignedIdentityPrincipalId string = uai.properties.principalId
-output containerAppName string = deployContainerApp ? containerApp!.name : ''
-output containerAppId string = deployContainerApp ? containerApp!.id : ''
-output containerAppFqdn string = deployContainerApp ? containerApp!.properties.configuration.ingress.fqdn : ''
 output functionAppName string = deployFunctionApp ? functionApp!.name : ''
 output functionPrincipalId string = deployFunctionApp ? functionApp!.identity.principalId : ''
 output functionStorageAccountName string = deployFunctionApp ? functionStorage!.name : ''

@@ -413,21 +413,75 @@ jobs:
                 SERVICE_BUS_QUEUE_NAME="siphon-queue" \
                 MEDIA_TMP_DIR="/tmp/siphon"
           else
-            # Create container app with identity+registry wiring so first revision can pull from ACR.
+            # Create container app via YAML template to support volumes
             if [ -n "${USER_ASSIGNED_IDENTITY_ID:-}" ]; then
               SERVICE_BUS_CONN="${SERVICE_BUS_CONNECTION_STRING:-${{ secrets.SERVICE_BUS_CONNECTION_STRING }}}"
+              
+              cat > /tmp/containerapp.yaml <<'YAML_EOF'
+properties:
+  environmentId: ENV_ID_PLACEHOLDER
+  configuration:
+    activeRevisionsMode: Single
+    registries:
+      - server: REGISTRY_SERVER_PLACEHOLDER
+        identity: USER_ASSIGNED_ID_PLACEHOLDER
+    ingress:
+      external: true
+      targetPort: 80
+      transport: Auto
+  identity:
+    type: UserAssigned
+    userAssignedIdentities:
+      - USER_ASSIGNED_ID_PLACEHOLDER
+  template:
+    containers:
+      - name: siphonbot-app
+        image: IMAGE_PLACEHOLDER
+        resources:
+          cpu: 0.5
+          memory: 1Gi
+        env:
+          - name: REDDIT_CLIENT_ID
+            secretRef: siphonbot-reddit-client-id
+          - name: REDDIT_CLIENT_SECRET
+            secretRef: siphonbot-reddit-client-secret
+          - name: REDDIT_USER_AGENT
+            secretRef: siphonbot-reddit-user-agent
+          - name: REDDIT_USERNAME
+            secretRef: siphonbot-reddit-username
+          - name: REDDIT_PASSWORD
+            secretRef: siphonbot-reddit-password
+          - name: DISCORD_TOKEN
+            secretRef: siphonbot-discord-token
+          - name: WEBHOOK
+            secretRef: siphonbot-discord-webhook
+          - name: SERVICE_BUS_CONNECTION_STRING
+            secretRef: siphonbot-service-bus-connection
+          - name: SERVICE_BUS_QUEUE_NAME
+            value: siphon-queue
+          - name: MEDIA_TMP_DIR
+            value: /tmp/siphon
+        volumeMounts:
+          - volumeName: ephemeral-downloads
+            mountPath: /tmp/siphon
+    volumes:
+      - name: ephemeral-downloads
+        storageType: EmptyDir
+    scale:
+      minReplicas: 0
+      maxReplicas: 1
+YAML_EOF
+              
+              # Replace placeholders
+              sed -i "s|ENV_ID_PLACEHOLDER|$ENV_ID|g" /tmp/containerapp.yaml
+              sed -i "s|REGISTRY_SERVER_PLACEHOLDER|$REGISTRY_SERVER|g" /tmp/containerapp.yaml
+              sed -i "s|USER_ASSIGNED_ID_PLACEHOLDER|$USER_ASSIGNED_IDENTITY_ID|g" /tmp/containerapp.yaml
+              sed -i "s|IMAGE_PLACEHOLDER|$FULL_IMAGE|g" /tmp/containerapp.yaml
+              
+              # Create container app with YAML template including volumes and UAI
               az containerapp create \
                 --resource-group "$RG" \
                 --name "$APP" \
-                --environment "$ENV_ID" \
-                --image "$FULL_IMAGE" \
-                --ingress 'external' \
-                --target-port 80 \
-                --min-replicas 0 \
-                --max-replicas 1 \
-                --user-assigned "$USER_ASSIGNED_IDENTITY_ID" \
-                --registry-server "$REGISTRY_SERVER" \
-                --registry-identity "$USER_ASSIGNED_IDENTITY_ID" \
                 --secrets \
                   siphonbot-reddit-client-id="${{ secrets.REDDIT_CLIENT_ID }}" \
                   siphonbot-reddit-client-secret="${{ secrets.REDDIT_CLIENT_SECRET }}" \
@@ -437,29 +491,71 @@ jobs:
                   siphonbot-discord-token="${{ secrets.DISCORD_TOKEN }}" \
                   siphonbot-discord-webhook="${{ secrets.WEBHOOK }}" \
                   siphonbot-service-bus-connection="${SERVICE_BUS_CONN}" \
-                --env-vars \
-                  REDDIT_CLIENT_ID="secretref:siphonbot-reddit-client-id" \
-                  REDDIT_CLIENT_SECRET="secretref:siphonbot-reddit-client-secret" \
-                  REDDIT_USER_AGENT="secretref:siphonbot-reddit-user-agent" \
-                  REDDIT_USERNAME="secretref:siphonbot-reddit-username" \
-                  REDDIT_PASSWORD="secretref:siphonbot-reddit-password" \
-                  DISCORD_TOKEN="secretref:siphonbot-discord-token" \
-                  WEBHOOK="secretref:siphonbot-discord-webhook" \
-                  SERVICE_BUS_CONNECTION_STRING="secretref:siphonbot-service-bus-connection" \
-                  SERVICE_BUS_QUEUE_NAME="siphon-queue" \
-                  MEDIA_TMP_DIR="/tmp/siphon"
+                --yaml /tmp/containerapp.yaml
+              rm -f /tmp/containerapp.yaml
             else
-              echo "No USER_ASSIGNED_IDENTITY_ID provided; creating app without managed registry identity"
+              # Create container app via YAML template to support volumes
               SERVICE_BUS_CONN="${SERVICE_BUS_CONNECTION_STRING:-${{ secrets.SERVICE_BUS_CONNECTION_STRING }}}"
+              
+              cat > /tmp/containerapp.yaml <<'YAML_EOF'
+properties:
+  environmentId: ENV_ID_PLACEHOLDER
+  configuration:
+    activeRevisionsMode: Single
+    registries:
+      - server: REGISTRY_SERVER_PLACEHOLDER
+    ingress:
+      external: true
+      targetPort: 80
+      transport: Auto
+  template:
+    containers:
+      - name: siphonbot-app
+        image: IMAGE_PLACEHOLDER
+        resources:
+          cpu: 0.5
+          memory: 1Gi
+        env:
+          - name: REDDIT_CLIENT_ID
+            secretRef: siphonbot-reddit-client-id
+          - name: REDDIT_CLIENT_SECRET
+            secretRef: siphonbot-reddit-client-secret
+          - name: REDDIT_USER_AGENT
+            secretRef: siphonbot-reddit-user-agent
+          - name: REDDIT_USERNAME
+            secretRef: siphonbot-reddit-username
+          - name: REDDIT_PASSWORD
+            secretRef: siphonbot-reddit-password
+          - name: DISCORD_TOKEN
+            secretRef: siphonbot-discord-token
+          - name: WEBHOOK
+            secretRef: siphonbot-discord-webhook
+          - name: SERVICE_BUS_CONNECTION_STRING
+            secretRef: siphonbot-service-bus-connection
+          - name: SERVICE_BUS_QUEUE_NAME
+            value: siphon-queue
+          - name: MEDIA_TMP_DIR
+            value: /tmp/siphon
+        volumeMounts:
+          - volumeName: ephemeral-downloads
+            mountPath: /tmp/siphon
+    volumes:
+      - name: ephemeral-downloads
+        storageType: EmptyDir
+    scale:
+      minReplicas: 0
+      maxReplicas: 1
+YAML_EOF
+              
+              # Replace placeholders
+              sed -i "s|ENV_ID_PLACEHOLDER|$ENV_ID|g" /tmp/containerapp.yaml
+              sed -i "s|REGISTRY_SERVER_PLACEHOLDER|$REGISTRY_SERVER|g" /tmp/containerapp.yaml
+              sed -i "s|IMAGE_PLACEHOLDER|$FULL_IMAGE|g" /tmp/containerapp.yaml
+              
+              # Create container app with YAML template including volumes
               az containerapp create \
                 --resource-group "$RG" \
                 --name "$APP" \
-                --environment "$ENV_ID" \
-                --image "$FULL_IMAGE" \
-                --ingress 'external' \
-                --target-port 80 \
-                --min-replicas 0 \
-                --max-replicas 1 \
                 --secrets \
                   siphonbot-reddit-client-id="${{ secrets.REDDIT_CLIENT_ID }}" \
                   siphonbot-reddit-client-secret="${{ secrets.REDDIT_CLIENT_SECRET }}" \
@@ -469,20 +565,9 @@ jobs:
                   siphonbot-discord-token="${{ secrets.DISCORD_TOKEN }}" \
                   siphonbot-discord-webhook="${{ secrets.WEBHOOK }}" \
                   siphonbot-service-bus-connection="${SERVICE_BUS_CONN}" \
-                --env-vars \
-                  REDDIT_CLIENT_ID="secretref:siphonbot-reddit-client-id" \
-                  REDDIT_CLIENT_SECRET="secretref:siphonbot-reddit-client-secret" \
-                  REDDIT_USER_AGENT="secretref:siphonbot-reddit-user-agent" \
-                  REDDIT_USERNAME="secretref:siphonbot-reddit-username" \
-                  REDDIT_PASSWORD="secretref:siphonbot-reddit-password" \
-                  DISCORD_TOKEN="secretref:siphonbot-discord-token" \
-                  WEBHOOK="secretref:siphonbot-discord-webhook" \
-                  SERVICE_BUS_CONNECTION_STRING="secretref:siphonbot-service-bus-connection" \
-                  SERVICE_BUS_QUEUE_NAME="siphon-queue" \
-                  MEDIA_TMP_DIR="/tmp/siphon"
+                --yaml /tmp/containerapp.yaml
+              rm -f /tmp/containerapp.yaml
             fi
-          fi
-
           fi
 
   start-container-app:

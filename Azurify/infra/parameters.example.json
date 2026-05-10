@@ -34,18 +34,6 @@
     },
     "containerAppPrincipalId": {
       "value": ""
-    },
-    "containerAppName": {
-      "value": "siphonbot-app"
-    },
-    "deployContainerApp": {
-      "value": true
-    },
-    "containerAppImageName": {
-      "value": "siphonbot"
-    },
-    "containerAppImageTag": {
-      "value": "latest"
     }
   }
 }
