@@ -17,6 +17,9 @@
     "functionAppName": {
       "value": "siphonbot-func"
     },
+    "functionStorageAccountName": {
+      "value": "siphonbotfuncappstorage"
+    },
     "deployFunctionApp": {
       "value": false
     },

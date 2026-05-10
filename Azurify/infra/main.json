@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.43.8.12551",
-      "templateHash": "8063485870832635809"
+      "templateHash": "15362097803694101972"
     }
   },
   "parameters": {
@@ -30,6 +30,13 @@
       "defaultValue": "[format('siphonbot-func-{0}', uniqueString(resourceGroup().id))]",
       "metadata": {
         "description": "Name for the optional Function App"
+      }
+    },
+    "functionStorageAccountName": {
+      "type": "string",
+      "defaultValue": "siphonbotfuncappstorage",
+      "metadata": {
+        "description": "Storage account name for Function host storage (lowercase letters and numbers only, 3-24 chars)."
       }
     },
     "deployFunctionApp": {
@@ -153,6 +160,22 @@
     },
     {
       "condition": "[parameters('deployFunctionApp')]",
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2023-05-01",
+      "name": "[parameters('functionStorageAccountName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard_LRS"
+      },
+      "kind": "StorageV2",
+      "properties": {
+        "supportsHttpsTrafficOnly": true,
+        "allowBlobPublicAccess": false,
+        "minimumTlsVersion": "TLS1_2"
+      }
+    },
+    {
+      "condition": "[parameters('deployFunctionApp')]",
       "type": "Microsoft.Web/sites",
       "apiVersion": "2023-01-01",
       "name": "[parameters('functionAppName')]",
@@ -180,7 +203,7 @@
             },
             {
               "name": "AzureWebJobsStorage",
-              "value": "[parameters('functionStorageConnectionString')]"
+              "value": "[if(empty(parameters('functionStorageConnectionString')), format('DefaultEndpointsProtocol=https;AccountName={0};AccountKey={1};EndpointSuffix={2}', parameters('functionStorageAccountName'), listKeys(resourceId('Microsoft.Storage/storageAccounts', parameters('functionStorageAccountName')), '2023-05-01').keys[0].value, environment().suffixes.storage), parameters('functionStorageConnectionString'))]"
             },
             {
               "name": "APPINSIGHTS_INSTRUMENTATIONKEY",
@@ -196,6 +219,7 @@
       "dependsOn": [
         "[resourceId('Microsoft.Insights/components', parameters('appInsightsName'))]",
         "[resourceId('Microsoft.Web/serverfarms', format('{0}-plan', parameters('functionAppName')))]",
+        "[resourceId('Microsoft.Storage/storageAccounts', parameters('functionStorageAccountName'))]",
         "[resourceId('Microsoft.ServiceBus/namespaces/queues', parameters('serviceBusName'), 'siphon-queue')]"
       ]
     },
@@ -271,6 +295,10 @@
     "functionPrincipalId": {
       "type": "string",
       "value": "[if(parameters('deployFunctionApp'), reference(resourceId('Microsoft.Web/sites', parameters('functionAppName')), '2023-01-01', 'full').identity.principalId, '')]"
+    },
+    "functionStorageAccountName": {
+      "type": "string",
+      "value": "[if(parameters('deployFunctionApp'), parameters('functionStorageAccountName'), '')]"
     }
   }
 }

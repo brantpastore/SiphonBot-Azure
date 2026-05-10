@@ -6,6 +6,9 @@ param appInsightsName string = 'appi-${uniqueString(resourceGroup().id)}'
 @description('Name for the optional Function App')
 param functionAppName string = 'siphonbot-func-${uniqueString(resourceGroup().id)}'
 
+@description('Storage account name for Function host storage (lowercase letters and numbers only, 3-24 chars).')
+param functionStorageAccountName string = 'siphonbotfuncappstorage'
+
 @description('Set true to deploy Function App resources. Requires functionStorageConnectionString.')
 param deployFunctionApp bool = false
 
@@ -92,6 +95,20 @@ resource functionPlan 'Microsoft.Web/serverfarms@2023-01-01' = if (deployFunctio
   }
 }
 
+resource functionStorage 'Microsoft.Storage/storageAccounts@2023-05-01' = if (deployFunctionApp) {
+  name: functionStorageAccountName
+  location: location
+  sku: {
+    name: 'Standard_LRS'
+  }
+  kind: 'StorageV2'
+  properties: {
+    supportsHttpsTrafficOnly: true
+    allowBlobPublicAccess: false
+    minimumTlsVersion: 'TLS1_2'
+  }
+}
+
 resource functionApp 'Microsoft.Web/sites@2023-01-01' = if (deployFunctionApp) {
   name: functionAppName
   location: location
@@ -118,7 +135,9 @@ resource functionApp 'Microsoft.Web/sites@2023-01-01' = if (deployFunctionApp) {
         }
         {
           name: 'AzureWebJobsStorage'
-          value: functionStorageConnectionString
+          value: empty(functionStorageConnectionString)
+            ? 'DefaultEndpointsProtocol=https;AccountName=${functionStorage!.name};AccountKey=${functionStorage!.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
+            : functionStorageConnectionString
         }
         {
           name: 'APPINSIGHTS_INSTRUMENTATIONKEY'
@@ -159,10 +178,14 @@ resource containerAppAcrPull 'Microsoft.Authorization/roleAssignments@2020-10-01
 output acrLoginServer string = acr.properties.loginServer
 output acrName string = acr.name
 output appInsightsId string = appInsights.id
+output appInsightsConnectionString string = appInsights.properties.ConnectionString
 output containerAppsEnvironmentId string = containerEnv.id
 output serviceBusNamespace string = sbNamespace.name
 output serviceBusQueue string = sbQueue.name
+output serviceBusConnectionString string = listkeys('${sbNamespace.id}/AuthorizationRules/RootManageSharedAccessKey', sbNamespace.apiVersion).primaryConnectionString
 output userAssignedIdentityId string = uai.id
 output userAssignedIdentityPrincipalId string = uai.properties.principalId
 output functionAppName string = deployFunctionApp ? functionApp!.name : ''
 output functionPrincipalId string = deployFunctionApp ? functionApp!.identity.principalId : ''
+output functionStorageAccountName string = deployFunctionApp ? functionStorage!.name : ''
+output functionStorageConnectionString string = deployFunctionApp ? 'DefaultEndpointsProtocol=https;AccountName=${functionStorage!.name};AccountKey=${functionStorage!.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}' : ''
