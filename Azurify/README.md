@@ -1,5 +1,11 @@
 Azurify — Azure scaffolding for SiphonBot
 
+Primary docs:
+- `COMPONENTS_README.md` — what each Azurify component does, why it exists, and architecture diagram.
+- `ARCHITECTURE.md` — architecture tradeoffs and service selection rationale.
+- `SECRETS_SETUP.md` — secret configuration options and verification.
+- `WORKLOAD_IDENTITY_SETUP.md` — GitHub OIDC setup guidance.
+
 This folder contains a minimal Option A scaffold: Bicep IaC, a GitHub Actions CI/CD workflow, a local deploy helper, and a sample Container Apps manifest.
 
 Files added:
