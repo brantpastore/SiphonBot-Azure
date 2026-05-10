@@ -31,10 +31,71 @@ jobs:
   # infra provisioning is handled outside the CI pipeline. This workflow
   # only builds/pushes the container image and updates existing app resources.
 
+  deploy-function:
+    runs-on: ubuntu-latest
+    needs: [lint-test]
+    env:
+      RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+      FUNCTION_NAME: ${{ vars.FUNCTION_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Login to Azure (prefer OIDC if configured)
+        uses: azure/login@v1
+        with:
+          auth-type: service_principal
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Expose function app secrets list
+        run: |
+          echo "FUNCTION_APP_SECRETS=${{ secrets.FUNCTION_APP_SECRETS }}" >> $GITHUB_ENV
+
+      - name: Configure Function App app settings from secrets
+        if: env.FUNCTION_NAME != '' && env.FUNCTION_APP_SECRETS != ''
+        run: |
+          IFS=',' read -ra PAIRS <<< "${FUNCTION_APP_SECRETS}"
+          RG=${{ env.RESOURCE_GROUP }}
+          APP=${{ env.FUNCTION_NAME }}
+          settings=()
+          for pair in "${PAIRS[@]}"; do
+            if [ -n "$pair" ]; then
+              settings+=("$pair")
+            fi
+          done
+          if [ ${#settings[@]} -gt 0 ]; then
+            az functionapp config appsettings set --name "$APP" --resource-group "$RG" --settings "${settings[@]}"
+          else
+            echo "No app settings found or FUNCTION_APP_SECRETS not configured."
+          fi
+
+      - name: Ensure Function queue/app settings
+        if: env.FUNCTION_NAME != ''
+        run: |
+          RG=${{ env.RESOURCE_GROUP }}
+          APP=${{ env.FUNCTION_NAME }}
+          az functionapp config appsettings set \
+            --name "$APP" \
+            --resource-group "$RG" \
+            --settings SERVICE_BUS_QUEUE_NAME=siphon-queue FUNCTIONS_WORKER_RUNTIME=python
+
+      - name: Deploy Azure Functions code
+        if: env.FUNCTION_NAME != ''
+        run: |
+          RG=${{ env.RESOURCE_GROUP }}
+          APP=${{ env.FUNCTION_NAME }}
+          rm -f functionapp.zip
+          rm -rf function_package
+          mkdir -p function_package
+          cp -R azure_functions/. function_package/
+          cp -R python_files function_package/python_files
+          (cd function_package && zip -r ../functionapp.zip .)
+          az functionapp deployment source config-zip \
+            --resource-group "$RG" \
+            --name "$APP" \
+            --src functionapp.zip
+
 
   build-and-push:
     runs-on: ubuntu-latest
-    needs: [lint-test]
+    needs: [lint-test, deploy-function]
     outputs:
       full_image: ${{ steps.set_image.outputs.full_image }}
     steps:
@@ -167,10 +228,6 @@ jobs:
             az role assignment create --assignee-object-id $principalId --role AcrPull --scope $acrId || true
             Write-Host "Assigned AcrPull via az CLI fallback"
           }
-
-      - name: Expose function app secrets list
-        run: |
-          echo "FUNCTION_APP_SECRETS=${{ secrets.FUNCTION_APP_SECRETS }}" >> $GITHUB_ENV
 
       - name: Upsert Container App secrets
         run: |
@@ -321,46 +378,11 @@ jobs:
                   template.containers[0].volumeMounts[0].volumeName=ephemeral-downloads \
                   template.containers[0].volumeMounts[0].mountPath=/tmp/siphon
 
-      - name: Configure Function App app settings from secrets
-        if: env.FUNCTION_NAME != '' && env.FUNCTION_APP_SECRETS != ''
-        run: |
-          IFS=',' read -ra PAIRS <<< "${FUNCTION_APP_SECRETS}"
-          RG=${{ env.RESOURCE_GROUP }}
-          APP=${{ env.FUNCTION_NAME }}
-          settings=()
-          for pair in "${PAIRS[@]}"; do
-            if [ -n "$pair" ]; then
-              settings+=("$pair")
-            fi
-          done
-          if [ ${#settings[@]} -gt 0 ]; then
-            az functionapp config appsettings set --name "$APP" --resource-group "$RG" --settings "${settings[@]}"
+          echo "Ensuring Container App is started when possible..."
+          RUNNING_STATUS=$(az containerapp show -g "$RG" -n "$APP" --query properties.runningStatus -o tsv 2>/dev/null || true)
+          if [ "$RUNNING_STATUS" = "Stopped" ]; then
+            az containerapp start -g "$RG" -n "$APP"
           else
-            echo "No app settings found or FUNCTION_APP_SECRETS not configured."
+            echo "Container App runningStatus is '$RUNNING_STATUS' (no explicit start needed)."
           fi
 
-      - name: Ensure Function queue/app settings
-        if: env.FUNCTION_NAME != ''
-        run: |
-          RG=${{ env.RESOURCE_GROUP }}
-          APP=${{ env.FUNCTION_NAME }}
-          az functionapp config appsettings set \
-            --name "$APP" \
-            --resource-group "$RG" \
-            --settings SERVICE_BUS_QUEUE_NAME=siphon-queue FUNCTIONS_WORKER_RUNTIME=python
-
-      - name: Deploy Azure Functions code
-        if: env.FUNCTION_NAME != ''
-        run: |
-          RG=${{ env.RESOURCE_GROUP }}
-          APP=${{ env.FUNCTION_NAME }}
-          rm -f functionapp.zip
-          rm -rf function_package
-          mkdir -p function_package
-          cp -R azure_functions/. function_package/
-          cp -R python_files function_package/python_files
-          (cd function_package && zip -r ../functionapp.zip .)
-          az functionapp deployment source config-zip \
-            --resource-group "$RG" \
-            --name "$APP" \
-            --src functionapp.zip
