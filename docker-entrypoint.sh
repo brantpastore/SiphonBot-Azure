@@ -14,9 +14,9 @@ set -e
 BGUTIL_SERVER_DIST="/opt/bgutil-ytdlp-pot-provider/server/build"
 BGUTIL_PORT="${YTDLP_BGUTIL_PORT:-4416}"
 
-if [ -f "${BGUTIL_SERVER_DIST}/server.js" ]; then
+if [ -f "${BGUTIL_SERVER_DIST}/main.js" ]; then
     echo "[entrypoint] Starting bgutil HTTP server on port ${BGUTIL_PORT}..."
-    node "${BGUTIL_SERVER_DIST}/server.js" &
+    node "${BGUTIL_SERVER_DIST}/main.js" &
     BGUTIL_PID=$!
 
     # Wait up to 10 seconds for the port to become reachable using only Python,

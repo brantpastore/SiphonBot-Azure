@@ -18,7 +18,7 @@ RUN git clone --depth 1 --single-branch --branch ${BGUTIL_VERSION} \
     cd /opt/bgutil-ytdlp-pot-provider/server && \
     npm ci && \
     npx tsc && \
-    ls -la /opt/bgutil-ytdlp-pot-provider/server/build/server.js
+    ls -la /opt/bgutil-ytdlp-pot-provider/server/build/main.js
 
 COPY text_files/requirements.txt ./
 RUN pip install --no-cache-dir --upgrade pip && \
