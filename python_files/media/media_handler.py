@@ -100,7 +100,16 @@ class MediaHandler:
         filepath = None
 
         try:
+            print(f"[VERBOSE] download_and_send called: url={url} user={getattr(interaction,'user',None)} guild={getattr(interaction,'guild',None)} channel={getattr(interaction,'channel',None)}")
             info = await self._extract_info(url)
+
+            # Log key metadata fields so operator can see what will be downloaded
+            if info:
+                title = info.get('title')
+                uploader = info.get('uploader') or info.get('uploader_id')
+                duration = info.get('duration')
+                filesize = info.get('filesize') or info.get('filesize_approx')
+                print(f"[VERBOSE] extracted info: title={title} uploader={uploader} duration={duration} filesize={filesize}")
 
             if info is None:
                 await safe_followup(
@@ -395,14 +404,79 @@ class MediaHandler:
 
         return None
 
-    async def _extract_info(self, url):
+    def _build_yt_opts(self, skip_download=True, format_str=None, **extra_opts):
+        """Build yt-dlp options with PO token/proxy/cookie support from env vars."""
         opts = {
             "quiet": True,
             "no_warnings": True,
-            "skip_download": True,
+            "skip_download": skip_download,
         }
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: self._yt_extract(url, opts))
+        
+        # Add format if specified
+        if format_str:
+            opts["format"] = format_str
+        
+        # YouTube-specific extraction args with PO token support
+        po_token = os.getenv("YTDLP_YOUTUBE_PO_TOKEN")
+        visitor_data = os.getenv("YTDLP_YOUTUBE_VISITOR_DATA")
+        cookies_file = os.getenv("YTDLP_COOKIES_FILE")
+        
+        if po_token or visitor_data or cookies_file:
+            opts["extractor_args"] = {"youtube": {}}
+            if po_token:
+                opts["extractor_args"]["youtube"]["po_token"] = [po_token]
+            if visitor_data:
+                opts["extractor_args"]["youtube"]["visitor_data"] = [visitor_data]
+        
+        # Cookies support
+        if cookies_file and os.path.exists(cookies_file):
+            opts["cookiefile"] = cookies_file
+        
+        # Proxy support
+        proxy = os.getenv("YTDLP_PROXY")
+        if proxy:
+            opts["proxy"] = proxy
+        
+        # Merge any extra options
+        opts.update(extra_opts)
+        return opts
+
+    async def _extract_info(self, url):
+        # Try with default client first (mweb), then fallback to web_safari with debug
+        for client in ["mweb", "web_safari"]:
+            try:
+                opts = self._build_yt_opts(skip_download=True)
+                
+                # Add YouTube client selection and PO token tracing
+                if "extractor_args" not in opts:
+                    opts["extractor_args"] = {}
+                if "youtube" not in opts["extractor_args"]:
+                    opts["extractor_args"]["youtube"] = {}
+                
+                opts["extractor_args"]["youtube"]["player_client"] = [client]
+                
+                # Enable debug for web_safari to help diagnose failures
+                if client == "web_safari":
+                    opts["verbose"] = True
+                
+                print(f"[VERBOSE] Attempting yt-dlp extraction with client={client}")
+                loop = asyncio.get_event_loop()
+                info = await loop.run_in_executor(None, lambda: self._yt_extract(url, opts))
+                return info
+                
+            except Exception as e:
+                error_msg = str(e)
+                if "Sign in to confirm you" in error_msg or "LOGIN_REQUIRED" in error_msg:
+                    if client == "mweb":
+                        print(f"[VERBOSE] Bot check with {client}; retrying with web_safari")
+                        continue
+                    else:
+                        # Both clients failed
+                        print(f"[VERBOSE] Both clients exhausted. Error: {error_msg}")
+                        raise
+                else:
+                    # Non-auth error, don't retry
+                    raise
 
     MERGE_DOMAINS = ["youtube.com", "youtu.be"]
 
@@ -414,13 +488,14 @@ class MediaHandler:
             fmt = f"bestvideo[ext=mp4][filesize<{limit_mb}M]+bestaudio[ext=m4a]/best[ext=mp4][filesize<{limit_mb}M]/best[filesize<{limit_mb}M]"
         else:
             fmt = f"best[filesize<{limit_mb}M]/best"
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "format": fmt,
-            "merge_output_format": "mp4",
-            "outtmpl": output_path,
-        }
+        
+        opts = self._build_yt_opts(
+            skip_download=False, 
+            format_str=fmt,
+            merge_output_format="mp4",
+            outtmpl=output_path
+        )
+        print(f"[VERBOSE] yt-dlp download options: format={fmt} outtmpl={output_path} upload_limit_mb={limit_mb}")
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: self._yt_download(url, opts))
 
