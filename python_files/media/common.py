@@ -5,12 +5,17 @@ import uuid
 import aiohttp
 import discord
 import shutil
+import logging
+import traceback
+from asyncio import sleep
 
-MAX_UPLOAD_BYTES = int(os.getenv("DISCORD_MAX_UPLOAD_MB", "10")) * 1024 * 1024
+logger = logging.getLogger(__name__)
+MAX_UPLOAD_BYTES = int(os.getenv("DISCORD_MAX_UPLOAD_MB", "25")) * 1024 * 1024
 
 
 def make_workdir():
-    path = os.path.join(tempfile.gettempdir(), f"media_{uuid.uuid4().hex}")
+    base_tmp = os.getenv("MEDIA_TMP_DIR") or tempfile.gettempdir()
+    path = os.path.join(base_tmp, f"media_{uuid.uuid4().hex}")
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -22,16 +27,26 @@ def cleanup(workdir, filepath=None):
         if workdir and os.path.isdir(workdir):
             shutil.rmtree(workdir, ignore_errors=True)
     except Exception as e:
-        print(f"Cleanup error: {e}")
+        logger.exception(f"Cleanup error: {e}")
 
 
 async def safe_followup(interaction, message):
+    """Send a followup with retry logic for transient Discord errors (issue 30)."""
     if interaction is None or not hasattr(interaction, "followup"):
         return
-    try:
-        await interaction.followup.send(message)
-    except Exception as e:
-        print(f"Failed to send followup: {e}")
+    max_retries = 2
+    for attempt in range(max_retries):
+        try:
+            await interaction.followup.send(message)
+            return
+        except Exception as e:
+            if attempt < max_retries - 1:
+                # Transient error; retry after brief delay
+                logger.warning(f"Followup failed (attempt {attempt + 1}), retrying: {e}")
+                await sleep(0.5)
+            else:
+                # Final failure
+                logger.exception(f"Failed to send followup after {max_retries} attempts: {e}\n{traceback.format_exc()}")
 
 
 async def send_content(interaction, content):
@@ -40,7 +55,7 @@ async def send_content(interaction, content):
     try:
         await interaction.channel.send(content=content)
     except Exception as e:
-        print(f"Failed to send content: {e}")
+        logger.exception(f"Failed to send content: {e}\n{traceback.format_exc()}")
 
 
 async def send_file(interaction, content, filepath):
@@ -52,4 +67,4 @@ async def send_file(interaction, content, filepath):
             await channel.send(content=content)
         await channel.send(file=discord.File(filepath))
     except Exception as e:
-        print(f"Failed to send file: {e}")
+        logger.exception(f"Failed to send file: {e}\n{traceback.format_exc()}")

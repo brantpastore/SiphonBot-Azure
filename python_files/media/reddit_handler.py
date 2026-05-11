@@ -3,7 +3,11 @@ import asyncio
 import os
 import subprocess
 import re
+import logging
+import traceback
 from urllib.parse import urljoin, urlparse
+
+logger = logging.getLogger(__name__)
 
 from utils import sanitize_filename, is_safe_url
 from media.common import (
@@ -17,11 +21,17 @@ from media.common import (
 
 
 def should_skip(post_data):
+    """Check if post should be skipped based on metadata (issue 32)."""
     if post_data.get("stickied"):
         return True
     if post_data.get("pinned"):
         return True
     if post_data.get("removed_by_category"):
+        return True
+    # Skip posts where media/author was removed
+    if post_data.get("author") == "[deleted]":
+        return True
+    if post_data.get("is_self") and not post_data.get("selftext"):
         return True
     return False
 
@@ -36,10 +46,56 @@ class RedditMediaHandler:
     def _limit(self, upload_limit):
         return upload_limit or MAX_UPLOAD_BYTES
 
+    @staticmethod
+    async def _domain_match(url: str, domains: list[str]) -> bool:
+        """Check if URL hostname matches any domain (issue 31: proper parsing vs substring match)."""
+        try:
+            parsed = urlparse(url)
+            hostname = parsed.hostname or ""
+            hostname_lower = hostname.lower()
+            for domain in domains:
+                domain_lower = domain.lower()
+                if hostname_lower == domain_lower or hostname_lower.endswith("." + domain_lower):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    async def _download_to_file(session, url, output_path, timeout_seconds):
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout_seconds)) as response:
+            response.raise_for_status()
+            with open(output_path, "wb") as f:
+                async for chunk in response.content.iter_chunked(8192):
+                    f.write(chunk)
+
+    @staticmethod
+    async def _download_hls_to_file(session, url, output_path, timeout_seconds):
+        async with session.get(
+            url, timeout=aiohttp.ClientTimeout(total=timeout_seconds, sock_read=None)
+        ) as response:
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "")
+            is_hls = (
+                "application/vnd.apple.mpegurl" in content_type
+                or "application/x-mpegurl" in content_type
+                or url.endswith(".m3u8")
+            )
+
+            if not is_hls:
+                extension = os.path.splitext(urlparse(url).path)[1] or ".mp4"
+                output_file = os.path.splitext(output_path)[0] + extension
+                with open(output_file, "wb") as f:
+                    async for chunk in response.content.iter_chunked(8192):
+                        f.write(chunk)
+                return output_file, False
+
+        return output_path, True
+
     async def scrape_subreddit(
         self, interaction, subreddit_url, num_posts, filter_type, time_range, upload_limit=None
     ):
-        print(f"Scraping {num_posts} posts from: {subreddit_url}")
+        logger.info("Scraping %s posts from: %s", num_posts, subreddit_url)
 
         fetch_limit = num_posts + 5
 
@@ -58,30 +114,44 @@ class RedditMediaHandler:
                     response.raise_for_status()
                     data = await response.json()
 
-            posts = data.get("data", {}).get("children", [])
-            filtered = [
-                p for p in posts if not should_skip(p.get("data", {}))
-            ][:num_posts]
+                posts = data.get("data", {}).get("children", [])
+                filtered = [
+                    p for p in posts if not should_skip(p.get("data", {}))
+                ][:num_posts]
 
-            print(f"Fetched {len(posts)} posts, {len(filtered)} after filtering.")
+                logger.info("Fetched %s posts, %s after filtering.", len(posts), len(filtered))
 
-            for post in filtered:
-                post_data = post.get("data", {})
-                if post_data:
-                    print("Moving to get_post_content for:", post_data.get("url"))
-                    await self.get_post_content(post_data, interaction, upload_limit=upload_limit)
+                # Issue 23: Parallelize post processing with semaphore to avoid overwhelming single vCPU
+                sem = asyncio.Semaphore(2)
+
+                async def process_post_with_sem(post):
+                    async with sem:
+                        post_data = post.get("data", {})
+                        if post_data:
+                            logger.debug("Moving to get_post_content for: %s", post_data.get("url"))
+                            await self.get_post_content(
+                                post_data,
+                                interaction,
+                                upload_limit=upload_limit,
+                                session=session,
+                            )
+
+                await asyncio.gather(
+                    *[process_post_with_sem(post) for post in filtered],
+                    return_exceptions=True
+                )
 
         except aiohttp.ClientResponseError as http_err:
-            print(f"HTTP error occurred: {http_err}")
+            logger.exception(f"HTTP error occurred: {http_err}\n{traceback.format_exc()}")
             await safe_followup(interaction, f"HTTP error occurred: {http_err}")
         except aiohttp.ClientError as e:
-            print(f"An error occurred: {e}")
+            logger.exception(f"An error occurred: {e}\n{traceback.format_exc()}")
             await safe_followup(interaction, f"An error occurred: {e}")
         except Exception as e:
-            print("Error encountered in scrape_subreddit:", e)
+            logger.exception(f"Error encountered in scrape_subreddit: {e}\n{traceback.format_exc()}")
             await safe_followup(interaction, f"An unexpected error occurred: {e}")
 
-    async def get_post_content(self, post, interaction=None, upload_limit=None):
+    async def get_post_content(self, post, interaction=None, upload_limit=None, session=None):
         try:
             url = post.get("url", "")
             title = post.get("title", "untitled")
@@ -90,7 +160,7 @@ class RedditMediaHandler:
             perm_url = post.get("permalink", "")
             reddit_post_url = urljoin("https://www.reddit.com", perm_url)
 
-            print("Getting post content for", url)
+            logger.info("Getting post content for %s", url)
 
             if gallery:
                 await self.process_gallery(post, title, interaction, nsfw)
@@ -122,11 +192,17 @@ class RedditMediaHandler:
                     interaction=interaction,
                     nsfw=nsfw,
                     upload_limit=upload_limit,
+                    session=session,
                 )
             elif video:
                 await self.process_video(
-                    video, title, backup_video=None, interaction=interaction, nsfw=nsfw,
+                    video,
+                    title,
+                    backup_video=None,
+                    interaction=interaction,
+                    nsfw=nsfw,
                     upload_limit=upload_limit,
+                    session=session,
                 )
             elif image:
                 await self.process_image(
@@ -136,6 +212,7 @@ class RedditMediaHandler:
                     interaction=interaction,
                     nsfw=nsfw,
                     upload_limit=upload_limit,
+                    session=session,
                 )
             elif gif:
                 await self.process_gif(
@@ -145,24 +222,23 @@ class RedditMediaHandler:
                     interaction=interaction,
                     nsfw=nsfw,
                     upload_limit=upload_limit,
+                    session=session,
                 )
-            elif self.media_handler and any(
-                domain in url for domain in self.EXTERNAL_VIDEO_DOMAINS
-            ):
+            elif self.media_handler and await self._domain_match(url, self.EXTERNAL_VIDEO_DOMAINS):
                 if not is_safe_url(url):
                     await safe_followup(interaction, "URL is not safe to access.")
                     return
-                print(f"External video detected, routing to MediaHandler: {url}")
+                logger.info(f"External video detected, routing to MediaHandler: {url}")
                 await self.media_handler.download_and_send(interaction, url, upload_limit=upload_limit)
             else:
-                print("No image, video, gif, or gallery found.")
+                logger.info("No image, video, gif, or gallery found.")
                 await safe_followup(
                     interaction,
                     f"No image, video, gif, or gallery found for post: {title} ({url})",
                 )
 
         except Exception as e:
-            print("Error getting post content:", e)
+            logger.exception(f"Error getting post content: {e}\n{traceback.format_exc()}")
             await safe_followup(
                 interaction,
                 f"An unexpected error occurred while processing the post: {e}",
@@ -174,28 +250,51 @@ class RedditMediaHandler:
             reddit_post_url = urljoin("https://www.reddit.com", perm_url)
             prefix = "NSFW: " if nsfw else ""
             message = f"{prefix}{title}\n{reddit_post_url}"
-            print(f"Gallery post detected - sending preview link: {reddit_post_url}")
+            logger.info("Gallery post detected - sending preview link: %s", reddit_post_url)
             await safe_followup(interaction, message)
         except Exception as e:
-            print("Error processing gallery content:", e)
+            logger.exception(f"Error processing gallery content: {e}\n{traceback.format_exc()}")
             await safe_followup(
                 interaction, f"Error processing gallery for {title}: {e}"
             )
 
     async def process_image(
-        self, image_url, title, reddit_post_url=None, interaction=None, nsfw=False, upload_limit=None
+        self, image_url, title, reddit_post_url=None, interaction=None, nsfw=False, upload_limit=None, session=None
     ):
-        print("Image URL:", image_url)
+        logger.debug("Image URL: %s", image_url)
         limit = self._limit(upload_limit)
         workdir = make_workdir()
         image_filename = os.path.join(workdir, sanitize_filename(f"{title}.jpg"))
 
         try:
-            async with aiohttp.ClientSession() as session:
+            if session is None:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        image_url, timeout=aiohttp.ClientTimeout(total=60)
+                    ) as response:
+                        response.raise_for_status()
+                        content_length = response.headers.get("Content-Length")
+                        if content_length and int(content_length) > limit:
+                            prefix = "NSFW: " if nsfw else ""
+                            await send_content(
+                                interaction, f"{prefix}{title}\n{reddit_post_url or image_url}"
+                            )
+                            return
+                        with open(image_filename, "wb") as f:
+                            async for chunk in response.content.iter_chunked(8192):
+                                f.write(chunk)
+            else:
                 async with session.get(
                     image_url, timeout=aiohttp.ClientTimeout(total=60)
                 ) as response:
                     response.raise_for_status()
+                    content_length = response.headers.get("Content-Length")
+                    if content_length and int(content_length) > limit:
+                        prefix = "NSFW: " if nsfw else ""
+                        await send_content(
+                            interaction, f"{prefix}{title}\n{reddit_post_url or image_url}"
+                        )
+                        return
                     with open(image_filename, "wb") as f:
                         async for chunk in response.content.iter_chunked(8192):
                             f.write(chunk)
@@ -219,15 +318,60 @@ class RedditMediaHandler:
             cleanup(workdir, image_filename)
 
     async def process_video(
-        self, video_url, title, backup_video=None, interaction=None, nsfw=False, upload_limit=None
+        self, video_url, title, backup_video=None, interaction=None, nsfw=False, upload_limit=None, session=None
     ):
-        print("Video URL:", video_url)
+        logger.debug("Video URL: %s", video_url)
         limit = self._limit(upload_limit)
         workdir = make_workdir()
         video_filename = None
 
         try:
-            async with aiohttp.ClientSession() as session:
+            if session is None:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        video_url, timeout=aiohttp.ClientTimeout(total=30, sock_read=None)
+                    ) as response:
+                        response.raise_for_status()
+                        content_type = response.headers.get("Content-Type", "")
+                        is_hls = (
+                            "application/vnd.apple.mpegurl" in content_type
+                            or "application/x-mpegurl" in content_type
+                        )
+
+                        if is_hls:
+                            video_filename = os.path.join(
+                                workdir, sanitize_filename(f"{title}.mp4")
+                            )
+                            await self._remux_hls(video_url, video_filename)
+                            if os.path.exists(video_filename) and os.path.getsize(video_filename) > limit:
+                                compressed_path = os.path.join(
+                                    workdir, sanitize_filename(f"{title}_compressed.mp4")
+                                )
+                                await self._run_ffmpeg(video_filename, compressed_path)
+                                video_filename = compressed_path
+                        else:
+                            content_length = response.headers.get("Content-Length")
+                            if content_length and int(content_length) > limit:
+                                logger.info(
+                                    "Video at %s is larger than the upload limit, sending link.",
+                                    video_url,
+                                )
+                                prefix = "NSFW: " if nsfw else ""
+                                await send_content(
+                                    interaction, f"{prefix}{title}\n{video_url}"
+                                )
+                                return
+
+                            extension = (
+                                os.path.splitext(urlparse(video_url).path)[1] or ".mp4"
+                            )
+                            video_filename = os.path.join(
+                                workdir, sanitize_filename(f"{title}{extension}")
+                            )
+                            with open(video_filename, "wb") as f:
+                                async for chunk in response.content.iter_chunked(8192):
+                                    f.write(chunk)
+            else:
                 async with session.get(
                     video_url, timeout=aiohttp.ClientTimeout(total=30, sock_read=None)
                 ) as response:
@@ -242,12 +386,19 @@ class RedditMediaHandler:
                         video_filename = os.path.join(
                             workdir, sanitize_filename(f"{title}.mp4")
                         )
-                        await self._run_ffmpeg(video_url, video_filename)
+                        await self._remux_hls(video_url, video_filename)
+                        if os.path.exists(video_filename) and os.path.getsize(video_filename) > limit:
+                            compressed_path = os.path.join(
+                                workdir, sanitize_filename(f"{title}_compressed.mp4")
+                            )
+                            await self._run_ffmpeg(video_filename, compressed_path)
+                            video_filename = compressed_path
                     else:
                         content_length = response.headers.get("Content-Length")
                         if content_length and int(content_length) > limit:
-                            print(
-                                f"Video at {video_url} is larger than the upload limit, sending link."
+                            logger.info(
+                                "Video at %s is larger than the upload limit, sending link.",
+                                video_url,
                             )
                             prefix = "NSFW: " if nsfw else ""
                             await send_content(
@@ -266,16 +417,16 @@ class RedditMediaHandler:
                                 f.write(chunk)
 
             if not video_filename or not os.path.exists(video_filename):
-                print("Video file was not created.")
+                logger.error("Video file was not created.")
                 return
 
             file_size = os.path.getsize(video_filename)
             if file_size == 0:
-                print("Downloaded video file is empty.")
+                logger.error("Downloaded video file is empty.")
                 return
 
             if file_size > limit:
-                print("Downloaded video file is too large to send to Discord.")
+                logger.warning("Downloaded video file is too large to send to Discord.")
                 fallback_url = backup_video or video_url
                 trimmed_url = (
                     re.sub(r"/DASH.*", "", fallback_url)
@@ -299,22 +450,22 @@ class RedditMediaHandler:
             await send_file(interaction, content, video_filename)
 
         except subprocess.TimeoutExpired:
-            print("FFmpeg process timed out.")
+            logger.warning("FFmpeg process timed out.")
         except subprocess.CalledProcessError as e:
-            print(f"Error processing video with ffmpeg: {e}")
+            logger.error(f"Error processing video with ffmpeg: {e}\n{traceback.format_exc()}")
         except aiohttp.ClientError as e:
-            print(f"Error downloading video: {e}")
+            logger.error(f"Error downloading video: {e}\n{traceback.format_exc()}")
         except Exception as e:
-            print(f"Unexpected error in process_video: {e}")
+            logger.exception(f"Unexpected error in process_video: {e}\n{traceback.format_exc()}")
         finally:
             cleanup(workdir, video_filename)
 
-    async def _run_ffmpeg(self, source_url, output_filename):
+    async def _run_ffmpeg(self, input_path, output_filename):
         ffmpeg_cmd = [
             "ffmpeg",
             "-y",
             "-i",
-            source_url,
+            input_path,
             "-c:v",
             "libx264",
             "-crf",
@@ -335,28 +486,73 @@ class RedditMediaHandler:
         await loop.run_in_executor(
             None, lambda: subprocess.run(ffmpeg_cmd, check=True, timeout=300)
         )
-        print(f"Successfully processed video: {output_filename}")
+        logger.info("Successfully processed video: %s", output_filename)
+
+    async def _remux_hls(self, source_url, output_filename):
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            source_url,
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            "-max_muxing_queue_size",
+            "1024",
+            output_filename,
+        ]
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None, lambda: subprocess.run(ffmpeg_cmd, check=True, timeout=300)
+        )
+        logger.info("Successfully remuxed HLS video: %s", output_filename)
 
     async def process_gif(
-        self, gif_url, title, reddit_post_url=None, interaction=None, nsfw=False, upload_limit=None
+        self, gif_url, title, reddit_post_url=None, interaction=None, nsfw=False, upload_limit=None, session=None
     ):
-        print("Gif URL:", gif_url)
+        logger.debug("Gif URL: %s", gif_url)
         limit = self._limit(upload_limit)
         workdir = make_workdir()
         gif_filename = os.path.join(workdir, sanitize_filename(f"{title}.gif"))
 
         try:
-            async with aiohttp.ClientSession() as session:
+            if session is None:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        gif_url, timeout=aiohttp.ClientTimeout(total=60)
+                    ) as response:
+                        response.raise_for_status()
+                        content_length = response.headers.get("Content-Length")
+                        if content_length and int(content_length) > limit:
+                            logger.info("GIF too large, sending link instead: %s", gif_url)
+                            prefix = "NSFW: " if nsfw else ""
+                            await send_content(
+                                interaction, f"{prefix}{title}\n{reddit_post_url or gif_url}"
+                            )
+                            return
+                        with open(gif_filename, "wb") as f:
+                            async for chunk in response.content.iter_chunked(8192):
+                                f.write(chunk)
+            else:
                 async with session.get(
                     gif_url, timeout=aiohttp.ClientTimeout(total=60)
                 ) as response:
                     response.raise_for_status()
+                    content_length = response.headers.get("Content-Length")
+                    if content_length and int(content_length) > limit:
+                        logger.info("GIF too large, sending link instead: %s", gif_url)
+                        prefix = "NSFW: " if nsfw else ""
+                        await send_content(
+                            interaction, f"{prefix}{title}\n{reddit_post_url or gif_url}"
+                        )
+                        return
                     with open(gif_filename, "wb") as f:
                         async for chunk in response.content.iter_chunked(8192):
                             f.write(chunk)
 
             if os.path.getsize(gif_filename) > limit:
-                print(f"GIF too large, sending link instead: {gif_url}")
+                logger.info("GIF too large, sending link instead: %s", gif_url)
                 prefix = "NSFW: " if nsfw else ""
                 await send_content(
                     interaction, f"{prefix}{title}\n{reddit_post_url or gif_url}"
@@ -376,8 +572,8 @@ class RedditMediaHandler:
             await safe_followup(interaction, "URL is not safe to access.")
             return
         try:
-            if "/s/" in reddit_url:
-                async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(headers=self.reddit_auth.get_headers()) as session:
+                if "/s/" in reddit_url:
                     async with session.get(
                         reddit_url,
                         allow_redirects=True,
@@ -385,19 +581,23 @@ class RedditMediaHandler:
                     ) as response:
                         reddit_url = str(response.url)
 
-            path = urlparse(reddit_url).path.rstrip("/")
-            api_url = f"https://oauth.reddit.com{path}.json"
+                path = urlparse(reddit_url).path.rstrip("/")
+                api_url = f"https://oauth.reddit.com{path}.json"
 
-            async with aiohttp.ClientSession(headers=self.reddit_auth.get_headers()) as session:
                 async with session.get(
                     api_url, timeout=aiohttp.ClientTimeout(total=15)
                 ) as response:
                     response.raise_for_status()
                     data = await response.json()
 
-            post_data = data[0]["data"]["children"][0]["data"]
-            await self.get_post_content(post_data, interaction, upload_limit=upload_limit)
+                post_data = data[0]["data"]["children"][0]["data"]
+                await self.get_post_content(
+                    post_data,
+                    interaction,
+                    upload_limit=upload_limit,
+                    session=session,
+                )
 
         except Exception as e:
-            print(f"Error fetching Reddit post: {e}")
+            logger.exception(f"Error fetching Reddit post: {e}\n{traceback.format_exc()}")
             await safe_followup(interaction, f"Error fetching post: {e}")

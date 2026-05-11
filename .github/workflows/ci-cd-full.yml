@@ -1,0 +1,786 @@
+name: CI/CD - Build, push, deploy (full)
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install test deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+      - name: Run basic lint/tests
+        run: |
+          echo "No tests configured; add pytest or flake8 to run tests"
+
+  # infra provisioning is handled outside the CI pipeline. This workflow
+  # only builds/pushes the container image and updates existing app resources.
+
+  deploy-function:
+    runs-on: ubuntu-latest
+    needs: [lint-test]
+    env:
+      RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+      FUNCTION_NAME: ${{ vars.FUNCTION_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Login to Azure (prefer OIDC if configured)
+        uses: azure/login@v1
+        with:
+          auth-type: service_principal
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Retrieve Function App storage connection string
+        run: |
+          RG="${RESOURCE_GROUP}"
+          
+          # Get the most recent deployment outputs from Bicep template
+          DEPLOYMENT_NAME=$(az deployment group list -g "$RG" --query "[0].name" -o tsv 2>/dev/null || true)
+          if [ -z "$DEPLOYMENT_NAME" ]; then
+            echo "No deployment found; attempting to retrieve storage account directly..."
+            STORAGE_ACCOUNT=$(az storage account list -g "$RG" --query "[0].name" -o tsv 2>/dev/null || true)
+            if [ -n "$STORAGE_ACCOUNT" ]; then
+              FUNCTION_STORAGE_CONNECTION_STRING=$(az storage account show-connection-string -g "$RG" -n "$STORAGE_ACCOUNT" --query connectionString -o tsv 2>/dev/null || true)
+              echo "FUNCTION_STORAGE_CONNECTION_STRING=$(echo "$FUNCTION_STORAGE_CONNECTION_STRING" | head -c 50)..."
+              echo "FUNCTION_STORAGE_CONNECTION_STRING=$FUNCTION_STORAGE_CONNECTION_STRING" >> $GITHUB_ENV
+            fi
+          else
+            echo "Using deployment outputs from: $DEPLOYMENT_NAME"
+            OUTPUTS=$(az deployment group show -g "$RG" -n "$DEPLOYMENT_NAME" --query properties.outputs -o json 2>/dev/null || echo '{}')
+            
+            # Function Storage connection string
+            FUNCTION_STORAGE_CONNECTION_STRING=$(echo "$OUTPUTS" | jq -r '.functionStorageConnectionString.value // empty' 2>/dev/null || true)
+            if [ -n "$FUNCTION_STORAGE_CONNECTION_STRING" ] && [ "$FUNCTION_STORAGE_CONNECTION_STRING" != "null" ]; then
+              echo "FUNCTION_STORAGE_CONNECTION_STRING=$(echo "$FUNCTION_STORAGE_CONNECTION_STRING" | head -c 50)..."
+              echo "FUNCTION_STORAGE_CONNECTION_STRING=$FUNCTION_STORAGE_CONNECTION_STRING" >> $GITHUB_ENV
+            fi
+          fi
+      - name: Expose function app secrets list
+        if: env.FUNCTION_NAME != ''
+        run: |
+          echo "FUNCTION_APP_SECRETS=${{ secrets.FUNCTION_APP_SECRETS }}" >> $GITHUB_ENV
+
+      - name: Configure Function App app settings from secrets
+        if: env.FUNCTION_NAME != '' && env.FUNCTION_APP_SECRETS != ''
+        run: |
+          IFS=',' read -ra PAIRS <<< "${FUNCTION_APP_SECRETS}"
+          RG=${{ env.RESOURCE_GROUP }}
+          APP=${{ env.FUNCTION_NAME }}
+          settings=()
+          for pair in "${PAIRS[@]}"; do
+            if [ -n "$pair" ]; then
+              settings+=("$pair")
+            fi
+          done
+          if [ ${#settings[@]} -gt 0 ]; then
+            az functionapp config appsettings set --name "$APP" --resource-group "$RG" --settings "${settings[@]}"
+          else
+            echo "No app settings found or FUNCTION_APP_SECRETS not configured."
+          fi
+
+      - name: Ensure Function runtime/app settings
+        if: env.FUNCTION_NAME != ''
+        env:
+          STORAGE_CONN_STR: ${{ env.FUNCTION_STORAGE_CONNECTION_STRING || secrets.FUNCTION_STORAGE_CONNECTION_STRING }}
+          SB_CONN_STR: ${{ secrets.SERVICE_BUS_CONNECTION_STRING }}
+        run: |
+          RG=${{ env.RESOURCE_GROUP }}
+          APP=${{ env.FUNCTION_NAME }}
+          
+          # Build settings array and set them all at once
+          # Only set storage if we have a connection string
+          # NOTE: WEBSITE_RUN_FROM_PACKAGE is intentionally NOT set here.
+          # The 'az functionapp deployment source config-zip' command sets it to
+          # the correct blob SAS URL automatically. Setting it to '1' here would
+          # put the runtime into a broken "run from local package" state before
+          # the zip is uploaded, causing sync_function_triggers to fail.
+          if [ -n "$STORAGE_CONN_STR" ]; then
+            az functionapp config appsettings set \
+              --name "$APP" \
+              --resource-group "$RG" \
+              --settings \
+                AzureWebJobsStorage="$STORAGE_CONN_STR" \
+                SERVICE_BUS_CONNECTION_STRING="$SB_CONN_STR" \
+                FUNCTIONS_EXTENSION_VERSION=~4 \
+                FUNCTIONS_WORKER_RUNTIME=python \
+                SERVICE_BUS_QUEUE_NAME=siphon-queue
+            echo "✓ Function App settings configured with storage and Service Bus"
+          else
+            # If no storage, still set runtime settings
+            az functionapp config appsettings set \
+              --name "$APP" \
+              --resource-group "$RG" \
+              --settings \
+                SERVICE_BUS_CONNECTION_STRING="$SB_CONN_STR" \
+                FUNCTIONS_EXTENSION_VERSION=~4 \
+                FUNCTIONS_WORKER_RUNTIME=python \
+                SERVICE_BUS_QUEUE_NAME=siphon-queue
+            echo "⚠ Function App settings configured (no storage connection string)"
+          fi
+
+      - name: Deploy Azure Functions code
+        if: env.FUNCTION_NAME != ''
+        run: |
+          RG=${{ env.RESOURCE_GROUP }}
+          APP=${{ env.FUNCTION_NAME }}
+          rm -f functionapp.zip
+          rm -rf function_package
+          mkdir -p function_package
+          cp -R azure_functions/. function_package/
+          cp -R python_files function_package/python_files
+          find function_package -name '*.Zone.Identifier' -delete
+          (cd function_package && zip -r ../functionapp.zip .)
+
+          echo "=== Function App info ==="
+          az functionapp show -g "$RG" -n "$APP" \
+            --query "{state:state,kind:kind,sku:sku,linuxFxVersion:siteConfig.linuxFxVersion,runtimeVersion:siteConfig.pythonVersion}" \
+            -o json
+
+          echo "=== Current app settings (names only) ==="
+          az functionapp config appsettings list -g "$RG" -n "$APP" \
+            --query "[].name" -o json
+
+          echo "=== Zip contents ==="
+          unzip -l functionapp.zip
+
+          echo "=== Deploying zip ==="
+          az functionapp deployment source config-zip \
+            --resource-group "$RG" \
+            --name "$APP" \
+            --src functionapp.zip \
+            --debug 2>&1 || {
+            EXIT=$?
+            echo "=== Deployment failed (exit $EXIT) — fetching Kudu deployment logs ==="
+            KUDU_URL="https://${APP}.scm.azurewebsites.net/api/deployments?$top=1"
+            TOKEN=$(az account get-access-token --resource https://management.azure.com --query accessToken -o tsv)
+            curl -sf -H "Authorization: Bearer $TOKEN" "$KUDU_URL" | python3 -m json.tool || true
+            exit $EXIT
+          }
+
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: [lint-test, deploy-function]
+    outputs:
+      full_image: ${{ steps.set_image.outputs.full_image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set image tag
+        run: echo "IMAGE_TAG=${GITHUB_SHA::8}" >> $GITHUB_ENV
+      - name: Login to Azure (prefer OIDC if configured)
+        uses: azure/login@v1
+        with:
+          auth-type: service_principal
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          enable-AzPSSession: true
+      - name: Debug Azure login
+        run: |
+          echo "--- az account show ---"
+          az account show || true
+          echo "--- az acr list (first 5) ---"
+          az acr list -o table || true
+
+      - name: Set env from secrets
+        run: |
+          # Prefer repository variables (`vars`) for non-sensitive identifiers,
+          # fall back to secrets if the var is not present.
+          echo "ACR_NAME=${{ vars.ACR_NAME }}" >> $GITHUB_ENV
+          echo "RESOURCE_GROUP=${{ vars.RESOURCE_GROUP }}" >> $GITHUB_ENV
+          echo "CONTAINERAPP_NAME=${{ vars.CONTAINERAPP_NAME }}" >> $GITHUB_ENV
+          echo "IMAGE_NAME=${{ vars.IMAGE_NAME }}" >> $GITHUB_ENV
+
+      - name: Login to ACR
+        run: az acr login --name $ACR_NAME
+
+      - name: Build and push Docker image
+        run: |
+          ACR_LOGIN_SERVER=$(az acr show -n $ACR_NAME --query loginServer -o tsv)
+          docker build -t $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG .
+          docker push $ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG
+
+      - name: Persist image info
+        run: |
+          echo "ACR_LOGIN_SERVER=$(az acr show -n $ACR_NAME --query loginServer -o tsv)" >> $GITHUB_ENV
+          echo "FULL_IMAGE=$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG" >> $GITHUB_ENV
+
+      - name: Set job output full_image
+        id: set_image
+        run: |
+          ACR_LOGIN_SERVER=$(az acr show -n $ACR_NAME --query loginServer -o tsv)
+          echo "full_image=$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    env:
+      ACR_NAME: ${{ vars.ACR_NAME }}
+      RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+      IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+      CONTAINERAPP_NAME: ${{ vars.CONTAINERAPP_NAME }}
+      FUNCTION_NAME: ${{ vars.FUNCTION_NAME }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Login to Azure (prefer OIDC if configured)
+        uses: azure/login@v1
+        with:
+          auth-type: service_principal
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Load infra names from secrets
+        run: |
+          # Prefer repository variables for non-sensitive identifiers; fall back to secrets.
+          echo "ACR_NAME=${{ vars.ACR_NAME }}" >> $GITHUB_ENV
+          echo "RESOURCE_GROUP=${{ vars.RESOURCE_GROUP }}" >> $GITHUB_ENV
+          echo "CONTAINERAPPS_ENV_ID=${{ vars.CONTAINERAPPS_ENV_ID || secrets.CONTAINERAPPS_ENV_ID || '' }}" >> $GITHUB_ENV
+          echo "USER_ASSIGNED_IDENTITY_ID=${{ vars.USER_ASSIGNED_IDENTITY_ID || secrets.USER_ASSIGNED_IDENTITY_ID || '' }}" >> $GITHUB_ENV
+          echo "FUNCTION_NAME=${{ vars.FUNCTION_NAME }}" >> $GITHUB_ENV
+          echo "IMAGE_NAME=${{ vars.IMAGE_NAME }}" >> $GITHUB_ENV
+          echo "AZURE_TENANT_ID=${{ vars.AZURE_TENANT_ID }}" >> $GITHUB_ENV
+          echo "AZURE_SUBSCRIPTION_ID=${{ vars.AZURE_SUBSCRIPTION_ID }}" >> $GITHUB_ENV
+
+      - name: Retrieve infrastructure connection strings
+        run: |
+          RG="${RESOURCE_GROUP}"
+          
+          # Get the most recent deployment outputs from Bicep template
+          DEPLOYMENT_NAME=$(az deployment group list -g "$RG" --query "[0].name" -o tsv 2>/dev/null || true)
+          if [ -z "$DEPLOYMENT_NAME" ]; then
+            echo "No deployment found in resource group. Using resource queries."
+            # Fallback: query resources directly if deployment outputs unavailable
+            
+            # Service Bus connection string
+            SB_NAMESPACE=$(az servicebus namespace list -g "$RG" --query "[0].name" -o tsv 2>/dev/null || true)
+            if [ -n "$SB_NAMESPACE" ]; then
+              SERVICE_BUS_CONNECTION_STRING=$(az servicebus namespace authorization-rule keys list -g "$RG" --namespace-name "$SB_NAMESPACE" --name RootManageSharedAccessKey --query primaryConnectionString -o tsv 2>/dev/null || true)
+              echo "SERVICE_BUS_CONNECTION_STRING=$(echo "$SERVICE_BUS_CONNECTION_STRING" | head -c 50)..." 
+              echo "SERVICE_BUS_CONNECTION_STRING=$SERVICE_BUS_CONNECTION_STRING" >> $GITHUB_ENV
+            fi
+            
+            # App Insights connection string
+            APP_INSIGHTS=$(az resource list -g "$RG" --resource-type "Microsoft.Insights/components" --query "[0]" -o json 2>/dev/null || true)
+            if [ -n "$APP_INSIGHTS" ] && [ "$APP_INSIGHTS" != "null" ]; then
+              APPINSIGHTS_CONNECTION_STRING=$(echo "$APP_INSIGHTS" | jq -r '.properties.ConnectionString // empty' 2>/dev/null || true)
+              echo "APPINSIGHTS_CONNECTION_STRING=$(echo "$APPINSIGHTS_CONNECTION_STRING" | head -c 50)..."
+              echo "APPINSIGHTS_CONNECTION_STRING=$APPINSIGHTS_CONNECTION_STRING" >> $GITHUB_ENV
+            fi
+            
+            # Function App Storage Account connection string
+            STORAGE_ACCOUNT=$(az storage account list -g "$RG" --query "[0].name" -o tsv 2>/dev/null || true)
+            if [ -n "$STORAGE_ACCOUNT" ]; then
+              FUNCTION_STORAGE_CONNECTION_STRING=$(az storage account show-connection-string -g "$RG" -n "$STORAGE_ACCOUNT" --query connectionString -o tsv 2>/dev/null || true)
+              echo "FUNCTION_STORAGE_CONNECTION_STRING=$(echo "$FUNCTION_STORAGE_CONNECTION_STRING" | head -c 50)..."
+              echo "FUNCTION_STORAGE_CONNECTION_STRING=$FUNCTION_STORAGE_CONNECTION_STRING" >> $GITHUB_ENV
+            fi
+          else
+            echo "Using deployment outputs from: $DEPLOYMENT_NAME"
+            # Extract connection strings from deployment outputs
+            OUTPUTS=$(az deployment group show -g "$RG" -n "$DEPLOYMENT_NAME" --query properties.outputs -o json 2>/dev/null || echo '{}')
+            
+            # Service Bus connection string
+            SERVICE_BUS_CONNECTION_STRING=$(echo "$OUTPUTS" | jq -r '.serviceBusConnectionString.value // empty' 2>/dev/null || true)
+            if [ -n "$SERVICE_BUS_CONNECTION_STRING" ] && [ "$SERVICE_BUS_CONNECTION_STRING" != "null" ]; then
+              echo "SERVICE_BUS_CONNECTION_STRING=$(echo "$SERVICE_BUS_CONNECTION_STRING" | head -c 50)..."
+              echo "SERVICE_BUS_CONNECTION_STRING=$SERVICE_BUS_CONNECTION_STRING" >> $GITHUB_ENV
+            fi
+            
+            # App Insights connection string
+            APPINSIGHTS_CONNECTION_STRING=$(echo "$OUTPUTS" | jq -r '.appInsightsConnectionString.value // empty' 2>/dev/null || true)
+            if [ -n "$APPINSIGHTS_CONNECTION_STRING" ] && [ "$APPINSIGHTS_CONNECTION_STRING" != "null" ]; then
+              echo "APPINSIGHTS_CONNECTION_STRING=$(echo "$APPINSIGHTS_CONNECTION_STRING" | head -c 50)..."
+              echo "APPINSIGHTS_CONNECTION_STRING=$APPINSIGHTS_CONNECTION_STRING" >> $GITHUB_ENV
+            fi
+            
+            # Function App Storage Account connection string
+            FUNCTION_STORAGE_CONNECTION_STRING=$(echo "$OUTPUTS" | jq -r '.functionStorageConnectionString.value // empty' 2>/dev/null || true)
+            if [ -n "$FUNCTION_STORAGE_CONNECTION_STRING" ] && [ "$FUNCTION_STORAGE_CONNECTION_STRING" != "null" ]; then
+              echo "FUNCTION_STORAGE_CONNECTION_STRING=$(echo "$FUNCTION_STORAGE_CONNECTION_STRING" | head -c 50)..."
+              echo "FUNCTION_STORAGE_CONNECTION_STRING=$FUNCTION_STORAGE_CONNECTION_STRING" >> $GITHUB_ENV
+            fi
+          fi
+          
+          echo "Infrastructure connection strings retrieved."
+
+      - name: Recompute image tag and FULL_IMAGE and validate (with debug)
+        run: |
+          echo "IMAGE_TAG=${GITHUB_SHA::8}" >> $GITHUB_ENV
+          echo "DEBUG: IMAGE_NAME=${IMAGE_NAME}"
+          echo "IMAGE_TAG=$IMAGE_TAG"
+          echo "ACR_NAME=$ACR_NAME"
+          echo "IMAGE_NAME=$IMAGE_NAME"
+          ACR_LOGIN_SERVER=$(az acr show -n $ACR_NAME --query loginServer -o tsv || true)
+          echo "ACR_LOGIN_SERVER=$ACR_LOGIN_SERVER"
+          echo "Looking for tag $IMAGE_TAG in $IMAGE_NAME..."
+          az acr repository show-tags -n $ACR_NAME --repository $IMAGE_NAME -o tsv || true
+          # construct FULL_IMAGE and verify manifest exists
+          FULL_IMAGE="$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG"
+          echo "FULL_IMAGE_CANDIDATE=$FULL_IMAGE"
+          manifest=$(az acr repository show-manifests -n $ACR_NAME --repository $IMAGE_NAME --query "[?contains(tags, '$IMAGE_TAG')].digest | [0]" -o tsv 2>/dev/null || true)
+          if [ -n "$manifest" ]; then
+            echo "Found manifest $manifest for tag $IMAGE_TAG"
+            echo "FULL_IMAGE=$FULL_IMAGE" >> $GITHUB_ENV
+          else
+            echo "Tag $IMAGE_TAG not found for repository $IMAGE_NAME in ACR $ACR_NAME — attempting fallback to latest manifest digest"
+            fallback_digest=$(az acr repository show-manifests -n $ACR_NAME --repository $IMAGE_NAME --orderby time_desc --top 1 --query "[0].digest" -o tsv 2>/dev/null || true)
+            if [ -n "$fallback_digest" ]; then
+              echo "Found latest manifest $fallback_digest, using digest reference"
+              FULL_IMAGE="$ACR_LOGIN_SERVER/$IMAGE_NAME@$fallback_digest"
+              echo "FULL_IMAGE=$FULL_IMAGE" >> $GITHUB_ENV
+            else
+              echo "ERROR: no tag $IMAGE_TAG and no manifest found for repository $IMAGE_NAME in ACR $ACR_NAME"
+              exit 1
+            fi
+          fi
+
+      - name: Ensure ACR Pull role assigned to UAI (PowerShell)
+        if: env.USER_ASSIGNED_IDENTITY_ID != ''
+        shell: pwsh
+        run: |
+          Write-Host "Ensuring AcrPull role for UAI: $env:USER_ASSIGNED_IDENTITY_ID"
+          $uaiResourceId = $env:USER_ASSIGNED_IDENTITY_ID
+          if (-not $uaiResourceId) { Write-Host "No UAI configured, skipping"; exit 0 }
+          $acrId = az acr show -n $env:ACR_NAME --query id -o tsv
+          if (-not $acrId) { Write-Host "Unable to resolve ACR id for $env:ACR_NAME"; exit 1 }
+          $principalId = az resource show --ids $uaiResourceId --query properties.principalId -o tsv
+          if (-not $principalId) { Write-Host "Could not get principalId for UAI $uaiResourceId"; exit 1 }
+          if (Get-Command New-AzRoleAssignment -ErrorAction SilentlyContinue) {
+            try {
+              New-AzRoleAssignment -ObjectId $principalId -RoleDefinitionName "AcrPull" -Scope $acrId -ErrorAction Stop
+              Write-Host "Assigned AcrPull via New-AzRoleAssignment"
+            } catch {
+              Write-Host "New-AzRoleAssignment failed: $_. Trying az CLI fallback"
+              az role assignment create --assignee-object-id $principalId --role AcrPull --scope $acrId || true
+            }
+          } else {
+            az role assignment create --assignee-object-id $principalId --role AcrPull --scope $acrId || true
+            Write-Host "Assigned AcrPull via az CLI fallback"
+          }
+
+      - name: Upsert Container App secrets
+        run: |
+          RG="${RESOURCE_GROUP}"
+          APP="${CONTAINERAPP_NAME}"
+
+          exists=$(az containerapp show -g "$RG" -n "$APP" --query name -o tsv || true)
+          if [ -z "$exists" ]; then
+            echo "Container App does not exist yet; secrets will be upserted after create."
+            exit 0
+          fi
+
+          # Use retrieved connection strings, fallback to secrets if not available
+          SERVICE_BUS_CONN="${SERVICE_BUS_CONNECTION_STRING:-${{ secrets.SERVICE_BUS_CONNECTION_STRING }}}"
+
+          az containerapp secret set -g "$RG" -n "$APP" --secrets \
+            siphonbot-reddit-client-id="${{ secrets.REDDIT_CLIENT_ID }}" \
+            siphonbot-reddit-client-secret="${{ secrets.REDDIT_CLIENT_SECRET }}" \
+            siphonbot-reddit-user-agent="${{ secrets.REDDIT_USER_AGENT }}" \
+            siphonbot-reddit-username="${{ secrets.REDDIT_USERNAME }}" \
+            siphonbot-reddit-password="${{ secrets.REDDIT_PASSWORD }}" \
+            siphonbot-discord-token="${{ secrets.DISCORD_TOKEN }}" \
+            siphonbot-discord-webhook="${{ secrets.WEBHOOK }}" \
+            siphonbot-service-bus-connection="${SERVICE_BUS_CONN}"
+
+          echo "Restarting Container App so secret changes take effect..."
+          az containerapp revision restart -g "$RG" -n "$APP" --revision "$(az containerapp show -g "$RG" -n "$APP" --query properties.latestRevisionName -o tsv)" || true
+
+      - name: Create or update Container App
+        run: |
+          # Prefer runtime FULL_IMAGE (set earlier via GITHUB_ENV), otherwise use the build job output
+          FULL_IMAGE="${FULL_IMAGE:-${{ needs.build-and-push.outputs.full_image }}}"
+          REGISTRY_SERVER="${FULL_IMAGE%%/*}"
+          RG="${RESOURCE_GROUP}"
+          APP="${CONTAINERAPP_NAME}"
+          ENV_ID="${CONTAINERAPPS_ENV_ID}"
+          echo "Using FULL_IMAGE=$FULL_IMAGE"
+          echo "Using REGISTRY_SERVER=$REGISTRY_SERVER"
+          if [ -z "$ENV_ID" ]; then echo "Container Apps environment ID not found. Ensure Bicep created the env."; exit 1; fi
+
+          UAI_CLIENT_ID=""
+          if [ -n "${USER_ASSIGNED_IDENTITY_ID:-}" ]; then
+            UAI_CLIENT_ID=$(az identity show --ids "$USER_ASSIGNED_IDENTITY_ID" --query clientId -o tsv 2>/dev/null || true)
+            if [ -z "$UAI_CLIENT_ID" ]; then
+              echo "Warning: could not resolve user-assigned identity clientId."
+            fi
+          fi
+
+          # If app exists but is in Failed provisioning state, delete it so we can recreate cleanly.
+          APP_STATE=$(az containerapp show -g "$RG" -n "$APP" --query properties.provisioningState -o tsv 2>/dev/null || true)
+          if [ "$APP_STATE" = "Failed" ]; then
+            echo "Container App is in Failed state. Deleting $APP before recreate..."
+            az containerapp delete -g "$RG" -n "$APP" --yes
+          fi
+
+          # If app exists, ensure UAI is assigned (so it can pull) then update image; otherwise create.
+          exists=$(az containerapp show -g $RG -n $APP --query name -o tsv || true)
+          if [ -n "$exists" ]; then
+            # assign UAI before updating image to ensure pull permission is available
+            if [ -n "${USER_ASSIGNED_IDENTITY_ID:-}" ]; then
+              echo "Assigning UAI to container app before update"
+              az containerapp identity assign -g $RG -n $APP --user-assigned "$USER_ASSIGNED_IDENTITY_ID" || true
+              echo "Configuring registry to use UAI for ACR pulls"
+              az containerapp registry set -g $RG -n $APP --server "$REGISTRY_SERVER" --identity "$USER_ASSIGNED_IDENTITY_ID" || true
+            fi
+            echo "Updating Container App with image and secretref env vars..."
+            SERVICE_BUS_CONN="${SERVICE_BUS_CONNECTION_STRING:-${{ secrets.SERVICE_BUS_CONNECTION_STRING }}}"
+            az containerapp secret set -g "$RG" -n "$APP" --secrets \
+              siphonbot-reddit-client-id="${{ secrets.REDDIT_CLIENT_ID }}" \
+              siphonbot-reddit-client-secret="${{ secrets.REDDIT_CLIENT_SECRET }}" \
+              siphonbot-reddit-user-agent="${{ secrets.REDDIT_USER_AGENT }}" \
+              siphonbot-reddit-username="${{ secrets.REDDIT_USERNAME }}" \
+              siphonbot-reddit-password="${{ secrets.REDDIT_PASSWORD }}" \
+              siphonbot-discord-token="${{ secrets.DISCORD_TOKEN }}" \
+              siphonbot-discord-webhook="${{ secrets.WEBHOOK }}" \
+              siphonbot-service-bus-connection="${SERVICE_BUS_CONN}"
+
+            az containerapp update -g $RG -n $APP --image "$FULL_IMAGE" \
+              --min-replicas 1 --max-replicas 1 \
+              --set-env-vars \
+                REDDIT_CLIENT_ID="secretref:siphonbot-reddit-client-id" \
+                REDDIT_CLIENT_SECRET="secretref:siphonbot-reddit-client-secret" \
+                REDDIT_USER_AGENT="secretref:siphonbot-reddit-user-agent" \
+                REDDIT_USERNAME="secretref:siphonbot-reddit-username" \
+                REDDIT_PASSWORD="secretref:siphonbot-reddit-password" \
+                DISCORD_TOKEN="secretref:siphonbot-discord-token" \
+                WEBHOOK="secretref:siphonbot-discord-webhook" \
+                SERVICE_BUS_CONNECTION_STRING="secretref:siphonbot-service-bus-connection" \
+                SERVICE_BUS_QUEUE_NAME="siphon-queue" \
+                MEDIA_TMP_DIR="/tmp/siphon" \
+                AZURE_SUBSCRIPTION_ID="${AZURE_SUBSCRIPTION_ID}" \
+                AZURE_RESOURCE_GROUP="${RG}" \
+                AZURE_CLIENT_ID="${UAI_CLIENT_ID}" \
+                DISCORD_SYNC_GLOBAL="false"
+          else
+            # Create container app via direct YAML file approach
+            if [ -n "${USER_ASSIGNED_IDENTITY_ID:-}" ]; then
+              SERVICE_BUS_CONN="${SERVICE_BUS_CONNECTION_STRING:-${{ secrets.SERVICE_BUS_CONNECTION_STRING }}}"
+              
+              # Build YAML file step by step to avoid heredoc parsing issues
+              {
+                echo "properties:"
+                echo "  environmentId: $ENV_ID"
+                echo "  configuration:"
+                echo "    activeRevisionsMode: Single"
+                echo "    registries:"
+                echo "      - server: $REGISTRY_SERVER"
+                echo "        identity: $USER_ASSIGNED_IDENTITY_ID"
+                echo "  identity:"
+                echo "    type: UserAssigned"
+                echo "    userAssignedIdentities:"
+                echo "      - $USER_ASSIGNED_IDENTITY_ID"
+                echo "  template:"
+                echo "    containers:"
+                echo "      - name: siphonbot-app"
+                echo "        image: $FULL_IMAGE"
+                echo "        resources:"
+                echo "          cpu: 1.0"
+                echo "          memory: 2Gi"
+                echo "        env:"
+                echo "          - name: REDDIT_CLIENT_ID"
+                echo "            secretRef: siphonbot-reddit-client-id"
+                echo "          - name: REDDIT_CLIENT_SECRET"
+                echo "            secretRef: siphonbot-reddit-client-secret"
+                echo "          - name: REDDIT_USER_AGENT"
+                echo "            secretRef: siphonbot-reddit-user-agent"
+                echo "          - name: REDDIT_USERNAME"
+                echo "            secretRef: siphonbot-reddit-username"
+                echo "          - name: REDDIT_PASSWORD"
+                echo "            secretRef: siphonbot-reddit-password"
+                echo "          - name: DISCORD_TOKEN"
+                echo "            secretRef: siphonbot-discord-token"
+                echo "          - name: WEBHOOK"
+                echo "            secretRef: siphonbot-discord-webhook"
+                echo "          - name: SERVICE_BUS_CONNECTION_STRING"
+                echo "            secretRef: siphonbot-service-bus-connection"
+                echo "          - name: SERVICE_BUS_QUEUE_NAME"
+                echo "            value: siphon-queue"
+                echo "          - name: MEDIA_TMP_DIR"
+                echo "            value: /tmp/siphon"
+                echo "          - name: AZURE_SUBSCRIPTION_ID"
+                echo "            value: $AZURE_SUBSCRIPTION_ID"
+                echo "          - name: AZURE_RESOURCE_GROUP"
+                echo "            value: $RG"
+                echo "          - name: AZURE_CLIENT_ID"
+                echo "            value: $UAI_CLIENT_ID"
+                echo "          - name: DISCORD_SYNC_GLOBAL"
+                echo "            value: false"
+                echo "        volumeMounts:"
+                echo "          - volumeName: ephemeral-downloads"
+                echo "            mountPath: /tmp/siphon"
+                echo "    volumes:"
+                echo "      - name: ephemeral-downloads"
+                echo "        storageType: EmptyDir"
+                echo "    scale:"
+                echo "      minReplicas: 1"
+                echo "      maxReplicas: 1"
+              } > /tmp/containerapp.yaml
+              
+              # Create container app with YAML template including volumes
+              az containerapp create \
+                --resource-group "$RG" \
+                --name "$APP" \
+                --secrets \
+                  siphonbot-reddit-client-id="${{ secrets.REDDIT_CLIENT_ID }}" \
+                  siphonbot-reddit-client-secret="${{ secrets.REDDIT_CLIENT_SECRET }}" \
+                  siphonbot-reddit-user-agent="${{ secrets.REDDIT_USER_AGENT }}" \
+                  siphonbot-reddit-username="${{ secrets.REDDIT_USERNAME }}" \
+                  siphonbot-reddit-password="${{ secrets.REDDIT_PASSWORD }}" \
+                  siphonbot-discord-token="${{ secrets.DISCORD_TOKEN }}" \
+                  siphonbot-discord-webhook="${{ secrets.WEBHOOK }}" \
+                  siphonbot-service-bus-connection="${SERVICE_BUS_CONN}" \
+                --yaml /tmp/containerapp.yaml
+              rm -f /tmp/containerapp.yaml
+            else
+              # Create container app via direct YAML file approach (no UAI)
+              SERVICE_BUS_CONN="${SERVICE_BUS_CONNECTION_STRING:-${{ secrets.SERVICE_BUS_CONNECTION_STRING }}}"
+              
+              # Build YAML file step by step to avoid heredoc parsing issues
+              {
+                echo "properties:"
+                echo "  environmentId: $ENV_ID"
+                echo "  configuration:"
+                echo "    activeRevisionsMode: Single"
+                echo "    registries:"
+                echo "      - server: $REGISTRY_SERVER"
+                echo "  template:"
+                echo "    containers:"
+                echo "      - name: siphonbot-app"
+                echo "        image: $FULL_IMAGE"
+                echo "        resources:"
+                echo "          cpu: 1.0"
+                echo "          memory: 2Gi"
+                echo "        env:"
+                echo "          - name: REDDIT_CLIENT_ID"
+                echo "            secretRef: siphonbot-reddit-client-id"
+                echo "          - name: REDDIT_CLIENT_SECRET"
+                echo "            secretRef: siphonbot-reddit-client-secret"
+                echo "          - name: REDDIT_USER_AGENT"
+                echo "            secretRef: siphonbot-reddit-user-agent"
+                echo "          - name: REDDIT_USERNAME"
+                echo "            secretRef: siphonbot-reddit-username"
+                echo "          - name: REDDIT_PASSWORD"
+                echo "            secretRef: siphonbot-reddit-password"
+                echo "          - name: DISCORD_TOKEN"
+                echo "            secretRef: siphonbot-discord-token"
+                echo "          - name: WEBHOOK"
+                echo "            secretRef: siphonbot-discord-webhook"
+                echo "          - name: SERVICE_BUS_CONNECTION_STRING"
+                echo "            secretRef: siphonbot-service-bus-connection"
+                echo "          - name: SERVICE_BUS_QUEUE_NAME"
+                echo "            value: siphon-queue"
+                echo "          - name: MEDIA_TMP_DIR"
+                echo "            value: /tmp/siphon"
+                echo "          - name: AZURE_SUBSCRIPTION_ID"
+                echo "            value: $AZURE_SUBSCRIPTION_ID"
+                echo "          - name: AZURE_RESOURCE_GROUP"
+                echo "            value: $RG"
+                echo "          - name: DISCORD_SYNC_GLOBAL"
+                echo "            value: false"
+                echo "        volumeMounts:"
+                echo "          - volumeName: ephemeral-downloads"
+                echo "            mountPath: /tmp/siphon"
+                echo "    volumes:"
+                echo "      - name: ephemeral-downloads"
+                echo "        storageType: EmptyDir"
+                echo "    scale:"
+                echo "      minReplicas: 1"
+                echo "      maxReplicas: 1"
+              } > /tmp/containerapp.yaml
+              
+              # Create container app with YAML template including volumes
+              az containerapp create \
+                --resource-group "$RG" \
+                --name "$APP" \
+                --secrets \
+                  siphonbot-reddit-client-id="${{ secrets.REDDIT_CLIENT_ID }}" \
+                  siphonbot-reddit-client-secret="${{ secrets.REDDIT_CLIENT_SECRET }}" \
+                  siphonbot-reddit-user-agent="${{ secrets.REDDIT_USER_AGENT }}" \
+                  siphonbot-reddit-username="${{ secrets.REDDIT_USERNAME }}" \
+                  siphonbot-reddit-password="${{ secrets.REDDIT_PASSWORD }}" \
+                  siphonbot-discord-token="${{ secrets.DISCORD_TOKEN }}" \
+                  siphonbot-discord-webhook="${{ secrets.WEBHOOK }}" \
+                  siphonbot-service-bus-connection="${SERVICE_BUS_CONN}" \
+                --yaml /tmp/containerapp.yaml
+              rm -f /tmp/containerapp.yaml
+            fi
+          fi
+
+          # This app is a Discord worker, not an HTTP service. Disable ingress to
+          # prevent platform startup probes from probing port 80 and marking replicas unhealthy.
+          az containerapp ingress disable -g "$RG" -n "$APP" || true
+
+      - name: Grant UAI Contributor role on Container App (enables listSecrets via Managed Identity)
+        if: env.USER_ASSIGNED_IDENTITY_ID != ''
+        run: |
+          RG="${RESOURCE_GROUP}"
+          APP="${CONTAINERAPP_NAME}"
+          UAI_ID="${USER_ASSIGNED_IDENTITY_ID}"
+
+          # Get the principal ID of the UAI
+          UAI_PRINCIPAL_ID=$(az resource show --ids "$UAI_ID" --query properties.principalId -o tsv 2>/dev/null || true)
+          if [ -z "$UAI_PRINCIPAL_ID" ]; then
+            echo "Could not resolve UAI principal ID; skipping role assignment."
+            exit 0
+          fi
+
+          # Get the Container App resource ID
+          APP_RESOURCE_ID=$(az containerapp show -g "$RG" -n "$APP" --query id -o tsv 2>/dev/null || true)
+          if [ -z "$APP_RESOURCE_ID" ]; then
+            echo "Container App not found; skipping role assignment."
+            exit 0
+          fi
+
+          # Assign Contributor on the Container App resource so the UAI can call listSecrets
+          az role assignment create \
+            --assignee-object-id "$UAI_PRINCIPAL_ID" \
+            --assignee-principal-type ServicePrincipal \
+            --role Contributor \
+            --scope "$APP_RESOURCE_ID" \
+            2>&1 | grep -v "already exists" || true
+          echo "✓ Contributor role ensured on Container App for UAI (enables Managed Identity listSecrets)"
+
+  start-container-app:
+    runs-on: ubuntu-latest
+    needs: deploy
+    env:
+      RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+      CONTAINERAPP_NAME: ${{ vars.CONTAINERAPP_NAME }}
+    steps:
+      - name: Login to Azure (prefer OIDC if configured)
+        uses: azure/login@v1
+        with:
+          auth-type: service_principal
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Start Container App if stopped
+        run: |
+          RG="${RESOURCE_GROUP}"
+          APP="${CONTAINERAPP_NAME}"
+
+          RUNNING_STATUS=$(az containerapp show -g "$RG" -n "$APP" --query properties.runningStatus -o tsv 2>/dev/null || true)
+          if [ "$RUNNING_STATUS" = "Stopped" ]; then
+            echo "Container App is stopped; attempting to start..."
+
+            if az containerapp start -h >/dev/null 2>&1; then
+              az containerapp start -g "$RG" -n "$APP" || true
+            else
+              echo "az containerapp start is unavailable in this runner CLI. Falling back to revision activate/restart."
+              LATEST_REVISION=$(az containerapp show -g "$RG" -n "$APP" --query properties.latestRevisionName -o tsv 2>/dev/null || true)
+              if [ -n "$LATEST_REVISION" ]; then
+                az containerapp revision activate -g "$RG" -n "$APP" --revision "$LATEST_REVISION" || true
+                az containerapp revision restart -g "$RG" -n "$APP" --revision "$LATEST_REVISION" || true
+              fi
+            fi
+
+            RUNNING_STATUS_AFTER=$(az containerapp show -g "$RG" -n "$APP" --query properties.runningStatus -o tsv 2>/dev/null || true)
+            echo "Container App runningStatus after start attempt: '$RUNNING_STATUS_AFTER'"
+          else
+            echo "Container App runningStatus is '$RUNNING_STATUS' (no explicit start needed)."
+          fi
+
+      - name: Ensure ingress stays disabled for worker
+        run: |
+          RG="${RESOURCE_GROUP}"
+          APP="${CONTAINERAPP_NAME}"
+          az containerapp ingress disable -g "$RG" -n "$APP" || true
+
+      - name: Health check Container App
+        run: |
+          RG="${RESOURCE_GROUP}"
+          APP="${CONTAINERAPP_NAME}"
+
+          ATTEMPTS=18
+          SLEEP_SECONDS=10
+
+          # Capture the revision this CI run deployed so we can detect if a concurrent
+          # run has superseded it mid-health-check (race condition with minReplicas=0).
+          DEPLOYED_REVISION=$(az containerapp show -g "$RG" -n "$APP" --query properties.latestRevisionName -o tsv 2>/dev/null || true)
+          echo "Deployed revision for this run: $DEPLOYED_REVISION"
+          ACTIVATING_STREAK=0
+
+          for i in $(seq 1 "$ATTEMPTS"); do
+            PROVISIONING_STATE=$(az containerapp show -g "$RG" -n "$APP" --query properties.provisioningState -o tsv 2>/dev/null || true)
+            RUNNING_STATUS=$(az containerapp show -g "$RG" -n "$APP" --query properties.runningStatus -o tsv 2>/dev/null || true)
+            MIN_REPLICAS=$(az containerapp show -g "$RG" -n "$APP" --query properties.template.scale.minReplicas -o tsv 2>/dev/null || true)
+            LATEST_REVISION=$(az containerapp show -g "$RG" -n "$APP" --query properties.latestRevisionName -o tsv 2>/dev/null || true)
+            LATEST_READY_REVISION=$(az containerapp show -g "$RG" -n "$APP" --query properties.latestReadyRevisionName -o tsv 2>/dev/null || true)
+
+            # Find the revision that currently holds 100% traffic — this may differ from
+            # latestRevisionName if a concurrent CI run has already promoted a newer revision.
+            TRAFFIC_REVISION=$(az containerapp revision list -g "$RG" -n "$APP" \
+              --query "[?properties.trafficWeight==\`100\`].name | [0]" -o tsv 2>/dev/null || true)
+            CHECK_REVISION="${TRAFFIC_REVISION:-$LATEST_REVISION}"
+
+            REV_RUNNING_STATE=$(az containerapp revision show -g "$RG" -n "$APP" --revision "$CHECK_REVISION" --query properties.runningState -o tsv 2>/dev/null || true)
+            REV_HEALTH_STATE=$(az containerapp revision show -g "$RG" -n "$APP" --revision "$CHECK_REVISION" --query properties.healthState -o tsv 2>/dev/null || true)
+            REV_TRAFFIC=$(az containerapp revision show -g "$RG" -n "$APP" --revision "$CHECK_REVISION" --query properties.trafficWeight -o tsv 2>/dev/null || true)
+            REV_REPLICAS=$(az containerapp revision list -g "$RG" -n "$APP" --query "[?name=='$CHECK_REVISION'].properties.replicas | [0]" -o tsv 2>/dev/null || true)
+            REV_ACTIVE=$(az containerapp revision list -g "$RG" -n "$APP" --query "[?name=='$CHECK_REVISION'].properties.active | [0]" -o tsv 2>/dev/null || true)
+
+            echo "Attempt $i/$ATTEMPTS: provisioningState=$PROVISIONING_STATE runningStatus=$RUNNING_STATUS minReplicas=$MIN_REPLICAS latestRevision=$LATEST_REVISION latestReadyRevision=$LATEST_READY_REVISION checkRevision=$CHECK_REVISION revActive=$REV_ACTIVE revRunningState=$REV_RUNNING_STATE revHealthState=$REV_HEALTH_STATE revTrafficWeight=$REV_TRAFFIC revReplicas=$REV_REPLICAS"
+
+            if [ "$PROVISIONING_STATE" = "Succeeded" ] && [ "$RUNNING_STATUS" = "Running" ] && [ "$REV_RUNNING_STATE" = "Running" ]; then
+              echo "Container App health check passed (active revision: $CHECK_REVISION)."
+              exit 0
+            fi
+
+            # Worker-style apps (ingress disabled) can report runningStatus=Stopped and
+            # trafficWeight=0 while the revision is still Active/Healthy/Provisioned.
+            if [ "$PROVISIONING_STATE" = "Succeeded" ] && [ "$REV_ACTIVE" = "true" ] && [ "$REV_HEALTH_STATE" = "Healthy" ] && [ "$LATEST_READY_REVISION" = "$CHECK_REVISION" ] && [ "$REV_RUNNING_STATE" != "ActivationFailed" ]; then
+              echo "Container App health check passed (worker revision is Active + Healthy + Ready)."
+              exit 0
+            fi
+
+            if [ "$RUNNING_STATUS" = "Running" ] && [ "$REV_RUNNING_STATE" = "Activating" ] && [ "$REV_TRAFFIC" = "100" ] && [ "${REV_REPLICAS:-0}" -ge 1 ] && [ "$REV_HEALTH_STATE" != "Unhealthy" ]; then
+              ACTIVATING_STREAK=$((ACTIVATING_STREAK + 1))
+            else
+              ACTIVATING_STREAK=0
+            fi
+
+            # Discord bot worker revisions can stay in Activating while replicas are live;
+            # treat sustained healthy Activating state as success to avoid false negatives.
+            if [ "$ACTIVATING_STREAK" -ge 3 ]; then
+              echo "Container App health check passed (stable Activating state with live replicas)."
+              exit 0
+            fi
+
+            # For background-worker style apps with minReplicas=0, the active revision can
+            # legitimately sit at 0 replicas (scale-to-zero) while still being healthy.
+            if [ "$PROVISIONING_STATE" = "Succeeded" ] && [ "$RUNNING_STATUS" = "Running" ] && [ "$MIN_REPLICAS" = "0" ] && [ "$REV_TRAFFIC" = "100" ] && [ "$REV_REPLICAS" = "0" ] && [ "$REV_RUNNING_STATE" != "ActivationFailed" ] && [ "$REV_HEALTH_STATE" != "Unhealthy" ]; then
+              echo "Container App health check passed (active revision scaled to zero by design)."
+              exit 0
+            fi
+
+            # If a concurrent CI run has promoted a newer revision that is already Running,
+            # treat this as a pass — our revision was superseded, not broken.
+            if [ -n "$TRAFFIC_REVISION" ] && [ "$TRAFFIC_REVISION" != "$DEPLOYED_REVISION" ] && { [ "$REV_RUNNING_STATE" = "Running" ] || [ "$REV_RUNNING_STATE" = "RunningAtMaxScale" ]; }; then
+              echo "Revision $DEPLOYED_REVISION was superseded by $TRAFFIC_REVISION which is healthy/running. Health check passed."
+              exit 0
+            fi
+
+            if [ "$REV_RUNNING_STATE" = "ActivationFailed" ] || [ "$REV_HEALTH_STATE" = "Unhealthy" ]; then
+              echo "Active revision ($CHECK_REVISION) failed activation/health checks. Dumping revision logs..."
+              az containerapp logs show -g "$RG" -n "$APP" --revision "$CHECK_REVISION" --tail 200 || true
+              break
+            fi
+
+            sleep "$SLEEP_SECONDS"
+          done
+
+          echo "Container App health check failed after $ATTEMPTS attempts."
+          az containerapp show -g "$RG" -n "$APP" -o jsonc || true
+          az containerapp revision list -g "$RG" -n "$APP" -o table || true
+          exit 1
+

@@ -1,11 +1,18 @@
 import asyncio
+import glob
 import math
 import os
 import subprocess
+import time
+import logging
+import traceback
 import discord
 from discord.ui import View, Button
 
 import yt_dlp
+from yt_dlp import version as yt_dlp_version
+
+logger = logging.getLogger(__name__)
 
 from utils import sanitize_filename, is_safe_url
 from media.common import (
@@ -89,7 +96,180 @@ class OversizeView(View):
 
 class MediaHandler:
     def __init__(self):
-        pass
+        self._info_cache: dict[str, tuple[float, dict]] = {}
+        self._youtube_client_cache: dict[str, str] = {}
+        self._cache_ttl_seconds = int(os.getenv("MEDIA_INFO_CACHE_TTL_SECONDS", "600"))
+
+    @staticmethod
+    def _split_csv_env(name: str, default: list[str]) -> list[str]:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return default
+        parts = [item.strip() for item in raw.split(",") if item.strip()]
+        return parts or default
+
+    def _youtube_candidate_clients(self) -> list[str]:
+        clients = self._split_csv_env("YTDLP_YOUTUBE_CLIENTS", ["mweb", "web_safari"])
+        deduped = []
+        for client in clients:
+            if client not in deduped:
+                deduped.append(client)
+        return deduped
+
+    @staticmethod
+    def _domain_kind(url: str) -> str:
+        lowered = (url or "").lower()
+        if any(domain in lowered for domain in ("youtube.com", "youtu.be")):
+            return "youtube"
+        if any(domain in lowered for domain in ("twitter.com", "x.com", "t.co")):
+            return "twitter"
+        return "generic"
+
+    def _build_base_ydl_opts(self, youtube_client: str = "mweb", force_debug: bool = False) -> dict:
+        debug_mode = force_debug or os.environ.get("LOG_LEVEL", "INFO").upper() == "DEBUG"
+        youtube_args = {
+            "player_client": [youtube_client],
+        }
+        if debug_mode:
+            youtube_args["pot_trace"] = ["true"]
+
+        trusted_po_token = os.getenv("YTDLP_YOUTUBE_PO_TOKEN", "").strip()
+        trusted_visitor_data = os.getenv("YTDLP_YOUTUBE_VISITOR_DATA", "").strip()
+        if trusted_po_token:
+            youtube_args["po_token"] = [trusted_po_token]
+        if trusted_visitor_data:
+            youtube_args["visitor_data"] = [trusted_visitor_data]
+
+        extractor_args = {
+            "youtube": youtube_args,
+            "youtubepot-bgutilscript": {
+                "server_home": ["/opt/bgutil-ytdlp-pot-provider/server"]
+            },
+        }
+
+        bgutil_http_base_url = os.getenv("YTDLP_BGUTIL_BASE_URL", "").strip()
+        if bgutil_http_base_url:
+            extractor_args["youtubepot-bgutilhttp"] = {
+                "base_url": [bgutil_http_base_url],
+            }
+
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "verbose": debug_mode,
+            # Ensure yt-dlp can execute JavaScript challenge providers with Node.js.
+            # In Azure logs we observed JSC "node (unavailable)" unless this is explicit.
+            "js_runtimes": {
+                "node": {},
+            },
+            # bgutil PO token provider for YouTube bot-check bypass (script mode)
+            "extractor_args": extractor_args,
+        }
+
+        proxy_url = os.getenv("YTDLP_PROXY", "").strip()
+        if proxy_url:
+            opts["proxy"] = proxy_url
+
+        cookie_file = os.getenv("YTDLP_COOKIES_FILE", "").strip()
+        if cookie_file:
+            opts["cookiefile"] = cookie_file
+
+        safe_youtube_args = dict(youtube_args)
+        if "po_token" in safe_youtube_args:
+            safe_youtube_args["po_token"] = ["<set>"]
+        if "visitor_data" in safe_youtube_args:
+            safe_youtube_args["visitor_data"] = ["<set>"]
+
+        logger.debug(
+            "yt-dlp base opts prepared (debug_mode=%s, yt_dlp_version=%s, cookiefile=%s, youtube_client=%s, proxy=%s, extractor_args=%s)",
+            debug_mode,
+            yt_dlp_version.__version__,
+            cookie_file or "<unset>",
+            youtube_client,
+            "<set>" if proxy_url else "<unset>",
+            {
+                "youtube": safe_youtube_args,
+                "youtubepot-bgutilscript": {
+                    "server_home": ["/opt/bgutil-ytdlp-pot-provider/server"],
+                },
+                "youtubepot-bgutilhttp": {
+                    "base_url": ["<set>"]
+                } if bgutil_http_base_url else "<unset>",
+            },
+        )
+        return opts
+
+    @staticmethod
+    def _is_youtube_bot_check_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return "sign in to confirm you" in msg and "not a bot" in msg
+
+    def _get_cached_info(self, url: str):
+        cached = self._info_cache.get(url)
+        if not cached:
+            return None
+        ts, info = cached
+        if (time.time() - ts) > self._cache_ttl_seconds:
+            self._info_cache.pop(url, None)
+            return None
+        return info
+
+    def _set_cached_info(self, url: str, info: dict):
+        self._info_cache[url] = (time.time(), info)
+
+    @staticmethod
+    def _pick_hls_manifest(info: dict | None) -> str | None:
+        if not isinstance(info, dict):
+            return None
+
+        direct_protocol = str(info.get("protocol", ""))
+        direct_url = info.get("url")
+        if direct_url and "m3u8" in direct_protocol:
+            return direct_url
+
+        requested = info.get("requested_formats") or []
+        for fmt in requested:
+            protocol = str(fmt.get("protocol", ""))
+            url = fmt.get("url")
+            if url and "m3u8" in protocol:
+                return url
+
+        formats = info.get("formats") or []
+        hls_candidates = [f for f in formats if f.get("url") and "m3u8" in str(f.get("protocol", ""))]
+        if not hls_candidates:
+            return None
+
+        # Prefer higher quality candidate when multiple HLS renditions are available.
+        best = max(
+            hls_candidates,
+            key=lambda f: (
+                f.get("height") or 0,
+                f.get("tbr") or 0,
+                f.get("fps") or 0,
+            ),
+        )
+        return best.get("url")
+
+    def _format_selector(self, url: str, limit_mb: int) -> str:
+        kind = self._domain_kind(url)
+        if kind == "youtube":
+            # Try a single-file mp4 first for speed, then fallback to merged formats.
+            return (
+                f"best[ext=mp4][filesize<{limit_mb}M]"
+                f"/best[filesize<{limit_mb}M]"
+                f"/bestvideo[ext=mp4][filesize<{limit_mb}M]+bestaudio[ext=m4a]"
+                f"/bestvideo+bestaudio/best"
+            )
+        if kind == "twitter":
+            # Prefer direct MP4 variants and avoid m3u8 where possible.
+            return (
+                f"best[ext=mp4][protocol!=m3u8_native][protocol!=m3u8][filesize<{limit_mb}M]"
+                f"/best[ext=mp4][filesize<{limit_mb}M]"
+                f"/best[ext=mp4][protocol!=m3u8_native][protocol!=m3u8]"
+                f"/best[ext=mp4]/best"
+            )
+        return f"best[ext=mp4][filesize<{limit_mb}M]/best[filesize<{limit_mb}M]/best"
 
     async def download_and_send(self, interaction, url, upload_limit=None):
         if not is_safe_url(url):
@@ -100,16 +280,7 @@ class MediaHandler:
         filepath = None
 
         try:
-            print(f"[VERBOSE] download_and_send called: url={url} user={getattr(interaction,'user',None)} guild={getattr(interaction,'guild',None)} channel={getattr(interaction,'channel',None)}")
             info = await self._extract_info(url)
-
-            # Log key metadata fields so operator can see what will be downloaded
-            if info:
-                title = info.get('title')
-                uploader = info.get('uploader') or info.get('uploader_id')
-                duration = info.get('duration')
-                filesize = info.get('filesize') or info.get('filesize_approx')
-                print(f"[VERBOSE] extracted info: title={title} uploader={uploader} duration={duration} filesize={filesize}")
 
             if info is None:
                 await safe_followup(
@@ -119,8 +290,10 @@ class MediaHandler:
 
             title = info.get("title", "video")
             estimated_size = self._estimate_filesize(info)
+            effective_limit = (upload_limit or MAX_UPLOAD_BYTES) - (1 * 1024 * 1024)
 
-            if estimated_size and estimated_size > MAX_DOWNLOAD_BYTES:
+            # Metadata-based short-circuit: decide oversize before downloading body.
+            if estimated_size and estimated_size > effective_limit:
                 est_mb = estimated_size // (1024 * 1024)
                 limit_mb = (
                     upload_limit // (1024 * 1024)
@@ -141,7 +314,17 @@ class MediaHandler:
             filename = sanitize_filename(f"{title}.mp4")
             filepath = os.path.join(workdir, filename)
 
-            await self._download(url, filepath, upload_limit=upload_limit)
+            # Fast path: if metadata points to an HLS stream, remux it directly to mp4
+            # using stream copy. This avoids a full re-encode and is typically much faster.
+            hls_manifest = self._pick_hls_manifest(info)
+            if hls_manifest:
+                try:
+                    await self._download_hls_remux(hls_manifest, filepath)
+                except Exception as remux_err:
+                    logger.warning(f"HLS remux fast-path failed, falling back to yt-dlp: {remux_err}")
+                    await self._download(url, filepath, upload_limit=upload_limit)
+            else:
+                await self._download(url, filepath, upload_limit=upload_limit)
 
             if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
                 await safe_followup(interaction, "Download failed - file is empty.")
@@ -149,7 +332,7 @@ class MediaHandler:
 
             file_size = os.path.getsize(filepath)
             if file_size > (upload_limit or MAX_UPLOAD_BYTES):
-                compress_viable = can_compress(info)
+                compress_viable = can_compress(info, upload_limit=upload_limit)
                 view = OversizeView(
                     self, interaction, url, info, compress_viable=compress_viable, upload_limit=upload_limit
                 )
@@ -163,7 +346,16 @@ class MediaHandler:
             await send_file(interaction, title, filepath)
 
         except Exception as e:
-            print(f"YouTube download error: {e}")
+            logger.exception(f"YouTube download error: {e}\n{traceback.format_exc()}")
+            if self._is_youtube_bot_check_error(e):
+                await safe_followup(
+                    interaction,
+                    "YouTube is still flagging this request as bot traffic. "
+                    "Try setting one or more of: YTDLP_PROXY, YTDLP_COOKIES_FILE, "
+                    "YTDLP_YOUTUBE_PO_TOKEN + YTDLP_YOUTUBE_VISITOR_DATA, or "
+                    "YTDLP_BGUTIL_BASE_URL.",
+                )
+                return
             await safe_followup(interaction, f"Error downloading video: {e}")
         finally:
             cleanup(workdir, filepath)
@@ -178,12 +370,29 @@ class MediaHandler:
             await safe_followup(
                 interaction, "Compressing video to fit under the limit..."
             )
-            await self._download(
-                url,
-                raw_path,
-                format_str="best[ext=mp4]/best",
-                upload_limit=upload_limit,
-            )
+            # Issue 18: Try HLS remux first to avoid re-encoding; fallback to download
+            hls_manifest = self._pick_hls_manifest(info)
+            if hls_manifest:
+                try:
+                    await self._download_hls_remux(hls_manifest, raw_path)
+                except Exception as remux_err:
+                    logger.warning(
+                        "HLS remux in compress failed, falling back to yt-dlp: %s",
+                        remux_err,
+                    )
+                    await self._download(
+                        url,
+                        raw_path,
+                        format_str="best[ext=mp4]/best",
+                        upload_limit=upload_limit,
+                    )
+            else:
+                await self._download(
+                    url,
+                    raw_path,
+                    format_str="best[ext=mp4]/best",
+                    upload_limit=upload_limit,
+                )
 
             if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
                 await safe_followup(interaction, "Download failed.")
@@ -194,30 +403,34 @@ class MediaHandler:
                 await safe_followup(interaction, "Could not determine video duration.")
                 return
 
-            # Get source height to avoid upscaling
-            loop = asyncio.get_event_loop()
-            probe_cmd = [
-                "ffprobe",
-                "-v",
-                "quiet",
-                "-select_streams",
-                "v:0",
-                "-show_entries",
-                "stream=height",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                raw_path,
-            ]
-            probe_result = await loop.run_in_executor(
-                None,
-                lambda: subprocess.run(
-                    probe_cmd, capture_output=True, text=True, timeout=30
-                ),
-            )
-            try:
-                source_height = int(probe_result.stdout.strip())
-            except (ValueError, AttributeError):
-                source_height = 720
+            # Issue 20: Get source height from info metadata when available, avoiding redundant ffprobe
+            source_height = info.get("height")
+            if not source_height:
+                loop = asyncio.get_event_loop()
+                probe_cmd = [
+                    "ffprobe",
+                    "-v",
+                    "quiet",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=height",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    raw_path,
+                ]
+                probe_result = await loop.run_in_executor(
+                    None,
+                    lambda: subprocess.run(
+                        probe_cmd, capture_output=True, text=True, timeout=30
+                    ),
+                )
+                try:
+                    source_height = int(probe_result.stdout.strip())
+                except (ValueError, AttributeError):
+                    source_height = 720
+            else:
+                source_height = int(source_height)
 
             target_height = min(source_height, 480)
 
@@ -228,7 +441,8 @@ class MediaHandler:
             audio_kbps = 96
             video_kbps = max(target_total_kbps - audio_kbps, MIN_VIDEO_KBPS)
 
-            ffmpeg_cmd = ["ffmpeg", "-y", "-i", raw_path]
+            # Issue 19: Add ffmpeg flags for faster transcode and better Discord compatibility
+            ffmpeg_cmd = ["ffmpeg", "-y", "-i", raw_path, "-threads", "0"]
 
             if source_height > target_height:
                 ffmpeg_cmd += ["-vf", f"scale=-2:{target_height}"]
@@ -244,6 +458,10 @@ class MediaHandler:
                 f"{video_kbps}k",
                 "-preset",
                 "veryfast",
+                "-tune",
+                "fastdecode",
+                "-movflags",
+                "+faststart",
                 "-c:a",
                 "aac",
                 "-b:a",
@@ -269,7 +487,7 @@ class MediaHandler:
             await send_file(interaction, title, out_path)
 
         except Exception as e:
-            print(f"Compress error: {e}")
+            logger.exception(f"Compress error: {e}\n{traceback.format_exc()}")
             await safe_followup(interaction, f"Error compressing video: {e}")
         finally:
             cleanup(workdir, raw_path)
@@ -305,38 +523,39 @@ class MediaHandler:
 
             limit = (upload_limit or MAX_UPLOAD_BYTES) - (1 * 1024 * 1024)
             num_parts = math.ceil(file_size / limit)
-            segment_duration = math.floor(duration / num_parts)
+            segment_duration = max(1, math.floor(duration / num_parts))
+            segment_pattern = os.path.join(workdir, "segment_%03d.mp4")
 
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                raw_path,
+                "-c",
+                "copy",
+                "-f",
+                "segment",
+                "-segment_time",
+                str(segment_duration),
+                "-reset_timestamps",
+                "1",
+                "-map",
+                "0",
+                segment_pattern,
+            ]
+
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(ffmpeg_cmd, check=True, timeout=600),
+            )
+
+            part_files = sorted(glob.glob(os.path.join(workdir, "segment_*.mp4")))
             parts = []
-            for i in range(num_parts):
-                start = i * segment_duration
-                end = min(start + segment_duration, int(duration))
-                part_path = os.path.join(
-                    workdir, sanitize_filename(f"{title}_part{i + 1}.mp4")
-                )
-                ffmpeg_cmd = [
-                    "ffmpeg",
-                    "-y",
-                    "-ss",
-                    str(start),
-                    "-i",
-                    raw_path,
-                    "-t",
-                    str(segment_duration),
-                    "-c",
-                    "copy",
-                    "-avoid_negative_ts",
-                    "make_zero",
-                    part_path,
-                ]
-
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(
-                    None,
-                    lambda cmd=ffmpeg_cmd: subprocess.run(cmd, check=True, timeout=300),
-                )
-
+            for idx, part_path in enumerate(part_files):
                 if os.path.exists(part_path) and os.path.getsize(part_path) > 0:
+                    start = idx * segment_duration
+                    end = min(start + segment_duration, int(duration))
                     parts.append((part_path, start, end))
 
             for idx, (part_path, start, end) in enumerate(parts):
@@ -348,7 +567,7 @@ class MediaHandler:
                 await send_file(interaction, part_title, part_path)
 
         except Exception as e:
-            print(f"Split error: {e}")
+            logger.exception(f"Split error: {e}\n{traceback.format_exc()}")
             await safe_followup(interaction, f"Error splitting video: {e}")
         finally:
             for f in os.listdir(workdir):
@@ -404,100 +623,129 @@ class MediaHandler:
 
         return None
 
-    def _build_yt_opts(self, skip_download=True, format_str=None, **extra_opts):
-        """Build yt-dlp options with PO token/proxy/cookie support from env vars."""
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": skip_download,
-        }
-        
-        # Add format if specified
-        if format_str:
-            opts["format"] = format_str
-        
-        # YouTube-specific extraction args with PO token support
-        po_token = os.getenv("YTDLP_YOUTUBE_PO_TOKEN")
-        visitor_data = os.getenv("YTDLP_YOUTUBE_VISITOR_DATA")
-        cookies_file = os.getenv("YTDLP_COOKIES_FILE")
-        
-        if po_token or visitor_data or cookies_file:
-            opts["extractor_args"] = {"youtube": {}}
-            if po_token:
-                opts["extractor_args"]["youtube"]["po_token"] = [po_token]
-            if visitor_data:
-                opts["extractor_args"]["youtube"]["visitor_data"] = [visitor_data]
-        
-        # Cookies support
-        if cookies_file and os.path.exists(cookies_file):
-            opts["cookiefile"] = cookies_file
-        
-        # Proxy support
-        proxy = os.getenv("YTDLP_PROXY")
-        if proxy:
-            opts["proxy"] = proxy
-        
-        # Merge any extra options
-        opts.update(extra_opts)
-        return opts
-
     async def _extract_info(self, url):
-        # Try with default client first (mweb), then fallback to web_safari with debug
-        for client in ["mweb", "web_safari"]:
+        cached = self._get_cached_info(url)
+        if cached is not None:
+            return cached
+
+        # Try configurable client list for YouTube; default remains mweb -> web_safari.
+        candidate_clients = self._youtube_candidate_clients() if self._domain_kind(url) == "youtube" else ["mweb"]
+
+        loop = asyncio.get_event_loop()
+        last_exc = None
+        info = None
+        chosen_client = "mweb"
+        for idx, client in enumerate(candidate_clients):
+            force_debug = idx > 0
+            opts = self._build_base_ydl_opts(youtube_client=client, force_debug=force_debug)
+            opts["skip_download"] = True
+            logger.info(
+                "Starting yt-dlp info extraction for %s (client=%s, debug=%s, yt-dlp=%s, yt_dlp_plugin=%s, cookiefile=%s)",
+                url,
+                client,
+                force_debug or os.environ.get("LOG_LEVEL", "INFO").upper() == "DEBUG",
+                yt_dlp_version.__version__,
+                "bgutil-ytdlp-pot-provider",
+                opts.get("cookiefile", "<unset>"),
+            )
             try:
-                opts = self._build_yt_opts(skip_download=True)
-                
-                # Add YouTube client selection and PO token tracing
-                if "extractor_args" not in opts:
-                    opts["extractor_args"] = {}
-                if "youtube" not in opts["extractor_args"]:
-                    opts["extractor_args"]["youtube"] = {}
-                
-                opts["extractor_args"]["youtube"]["player_client"] = [client]
-                
-                # Enable debug for web_safari to help diagnose failures
-                if client == "web_safari":
-                    opts["verbose"] = True
-                
-                print(f"[VERBOSE] Attempting yt-dlp extraction with client={client}")
-                loop = asyncio.get_event_loop()
                 info = await loop.run_in_executor(None, lambda: self._yt_extract(url, opts))
-                return info
-                
-            except Exception as e:
-                error_msg = str(e)
-                if "Sign in to confirm you" in error_msg or "LOGIN_REQUIRED" in error_msg:
-                    if client == "mweb":
-                        print(f"[VERBOSE] Bot check with {client}; retrying with web_safari")
-                        continue
-                    else:
-                        # Both clients failed
-                        print(f"[VERBOSE] Both clients exhausted. Error: {error_msg}")
-                        raise
-                else:
-                    # Non-auth error, don't retry
+                chosen_client = client
+                break
+            except Exception as exc:
+                last_exc = exc
+                next_client = candidate_clients[idx + 1] if (idx + 1) < len(candidate_clients) else None
+                if not next_client or not self._is_youtube_bot_check_error(exc):
                     raise
+                logger.warning(
+                    "YouTube bot-check encountered with client=%s; retrying with client=%s",
+                    client,
+                    next_client,
+                )
+
+        if info is None and last_exc is not None:
+            raise last_exc
+
+        if info is not None:
+            self._set_cached_info(url, info)
+            self._youtube_client_cache[url] = chosen_client
+        return info
 
     MERGE_DOMAINS = ["youtube.com", "youtu.be"]
 
-    async def _download(self, url, output_path, format_str=None, upload_limit=None):
-        limit_mb = (upload_limit or MAX_UPLOAD_BYTES) // (1024 * 1024) - 5
+    async def _download(self, url, output_path, format_str=None, upload_limit=None, youtube_client=None):
+        # Use consistent 1MB headroom (issue 17: was mixing 1MB vs 5MB)
+        limit_bytes = (upload_limit or MAX_UPLOAD_BYTES) - (1 * 1024 * 1024)
+        limit_mb = limit_bytes // (1024 * 1024)
         if format_str:
             fmt = format_str
-        elif any(domain in url for domain in self.MERGE_DOMAINS):
-            fmt = f"bestvideo[ext=mp4][filesize<{limit_mb}M]+bestaudio[ext=m4a]/best[ext=mp4][filesize<{limit_mb}M]/best[filesize<{limit_mb}M]"
         else:
-            fmt = f"best[filesize<{limit_mb}M]/best"
-        
-        opts = self._build_yt_opts(
-            skip_download=False, 
-            format_str=fmt,
-            merge_output_format="mp4",
-            outtmpl=output_path
-        )
-        print(f"[VERBOSE] yt-dlp download options: format={fmt} outtmpl={output_path} upload_limit_mb={limit_mb}")
+            fmt = self._format_selector(url, limit_mb)
+        default_client = youtube_client or self._youtube_client_cache.get(url, "mweb")
+        candidate_clients = [default_client]
+        if self._domain_kind(url) == "youtube":
+            for client in self._youtube_candidate_clients():
+                if client not in candidate_clients:
+                    candidate_clients.append(client)
+
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lambda: self._yt_download(url, opts))
+        last_exc = None
+        for idx, client in enumerate(candidate_clients):
+            force_debug = idx > 0
+            opts = self._build_base_ydl_opts(youtube_client=client, force_debug=force_debug)
+            opts.update(
+                {
+                    "format": fmt,
+                    "merge_output_format": "mp4",
+                    "outtmpl": output_path,
+                }
+            )
+            logger.info(
+                "Starting yt-dlp download for %s (client=%s, format=%s, debug=%s, yt-dlp=%s, yt_dlp_plugin=%s)",
+                url,
+                client,
+                fmt,
+                force_debug or os.environ.get("LOG_LEVEL", "INFO").upper() == "DEBUG",
+                yt_dlp_version.__version__,
+                "bgutil-ytdlp-pot-provider",
+            )
+            try:
+                await loop.run_in_executor(None, lambda: self._yt_download(url, opts))
+                self._youtube_client_cache[url] = client
+                return
+            except Exception as exc:
+                last_exc = exc
+                next_client = candidate_clients[idx + 1] if (idx + 1) < len(candidate_clients) else None
+                if not next_client or not self._is_youtube_bot_check_error(exc):
+                    raise
+                logger.warning(
+                    "YouTube bot-check encountered during download with client=%s; retrying with client=%s",
+                    client,
+                    next_client,
+                )
+
+        if last_exc is not None:
+            raise last_exc
+
+    async def _download_hls_remux(self, manifest_url: str, output_path: str):
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            manifest_url,
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            "-bsf:a",
+            "aac_adtstoasc",
+            output_path,
+        ]
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: subprocess.run(cmd, check=True, timeout=300),
+        )
 
     @staticmethod
     def _yt_extract(url, opts):
