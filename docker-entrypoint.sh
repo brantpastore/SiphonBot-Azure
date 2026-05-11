@@ -11,7 +11,7 @@
 
 set -e
 
-BGUTIL_SERVER_DIST="/opt/bgutil-ytdlp-pot-provider/server/dist"
+BGUTIL_SERVER_DIST="/opt/bgutil-ytdlp-pot-provider/server/build"
 BGUTIL_PORT="${YTDLP_BGUTIL_PORT:-4416}"
 
 if [ -f "${BGUTIL_SERVER_DIST}/server.js" ]; then
