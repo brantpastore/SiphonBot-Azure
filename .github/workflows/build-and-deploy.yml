@@ -1,0 +1,159 @@
+name: Build and Deploy SiphonBot
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'python_files/**'
+      - 'Dockerfile'
+      - 'text_files/requirements.txt'
+      - '.github/workflows/build-and-deploy.yml'
+  workflow_dispatch:
+
+env:
+  REGISTRY_NAME: siphonbotacr
+  IMAGE_NAME: siphonbot
+  CONTAINER_APP_NAME: siphonbot-app
+  RESOURCE_GROUP: siphon_bot
+  LOCATION: centralus
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      
+      - name: Login to ACR
+        run: |
+          az acr login --name ${{ env.REGISTRY_NAME }}
+      
+      - name: Get ACR login credentials for Docker
+        run: |
+          TOKEN=$(az acr login --name ${{ env.REGISTRY_NAME }} --expose-token --output tsv --query accessToken)
+          docker login ${{ env.REGISTRY_NAME }}.azurecr.io -u 00000000-0000-0000-0000-000000000000 --password-stdin <<< $TOKEN
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=registry,ref=${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:buildcache,mode=max
+      
+      - name: Output image digest
+        run: echo "Image digest: ${{ steps.docker_build.outputs.digest }}"
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      
+      - name: Update Container App image
+        run: |
+          az containerapp update \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image ${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
+      
+      - name: Wait for deployment to stabilize
+        run: |
+          echo "Waiting for Container App revision to stabilize..."
+          for i in {1..30}; do
+            STATUS=$(az containerapp show \
+              --name ${{ env.CONTAINER_APP_NAME }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --query "properties.runningStatus" -o tsv 2>/dev/null)
+            
+            if [ "$STATUS" = "Running" ]; then
+              echo "Container App is running"
+              break
+            fi
+            
+            echo "Status: $STATUS (attempt $i/30)"
+            sleep 10
+          done
+      
+      - name: Verify deployment health
+        run: |
+          LATEST_REVISION=$(az containerapp show \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.latestRevisionName" -o tsv)
+          
+          echo "Latest revision: $LATEST_REVISION"
+          
+          az containerapp revision show \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --revision $LATEST_REVISION \
+            -o table
+
+  smoke-test:
+    needs: deploy
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      
+      - name: Get Container App URL
+        id: app_url
+        run: |
+          URL=$(az containerapp show \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          echo "app_url=https://$URL" >> $GITHUB_OUTPUT
+      
+      - name: Basic health check
+        continue-on-error: true
+        run: |
+          # Attempt basic connectivity test
+          echo "Testing Container App connectivity..."
+          curl -I ${{ steps.app_url.outputs.app_url }} || echo "Note: Health check request completed (may timeout on Discord bot)"
