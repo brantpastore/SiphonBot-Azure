@@ -25,10 +25,15 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir bgutil-ytdlp-pot-provider==${BGUTIL_VERSION}
 
 COPY python_files /usr/src/app/python_files
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-# Keep the runtime deterministic so the bundled yt-dlp plugin stays aligned with the
-# yt-dlp version installed during the image build.
+# The entrypoint starts the bgutil HTTP server (port 4416) before the bot so that
+# yt-dlp uses HTTP mode, which manages visitor_data/PO-token state internally.
+# This avoids the "bot-check" failures that occur when script mode uses a stale
+# externally-supplied visitor_data.
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["python", "python_files/main.py"]

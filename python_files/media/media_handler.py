@@ -99,6 +99,27 @@ class MediaHandler:
         self._info_cache: dict[str, tuple[float, dict]] = {}
         self._youtube_client_cache: dict[str, str] = {}
         self._cache_ttl_seconds = int(os.getenv("MEDIA_INFO_CACHE_TTL_SECONDS", "600"))
+        self._warn_stale_visitor_data()
+
+    @staticmethod
+    def _warn_stale_visitor_data() -> None:
+        """Warn at startup when YTDLP_YOUTUBE_VISITOR_DATA is set while bgutil HTTP mode
+        is active.  The HTTP server manages its own fresh visitor_data/PO-token pair;
+        an externally-supplied (and potentially stale) visitor_data causes YouTube to
+        reject the PO token with a bot-check error."""
+        bgutil_url = os.getenv("YTDLP_BGUTIL_BASE_URL", "").strip()
+        visitor_data = os.getenv("YTDLP_YOUTUBE_VISITOR_DATA", "").strip()
+        if bgutil_url and visitor_data:
+            logger.warning(
+                "[config] YTDLP_YOUTUBE_VISITOR_DATA is set ('%s') alongside "
+                "YTDLP_BGUTIL_BASE_URL ('%s'). The bgutil HTTP server manages "
+                "visitor_data internally; a stale external value is the most common "
+                "cause of bot-check failures even when bgutil is running. "
+                "Unset YTDLP_YOUTUBE_VISITOR_DATA unless you are providing a fresh, "
+                "matched visitor_data+PO-token pair.",
+                visitor_data,
+                bgutil_url,
+            )
 
     @staticmethod
     def _split_csv_env(name: str, default: list[str]) -> list[str]:
