@@ -39,6 +39,10 @@ jobs:
       FUNCTION_NAME: ${{ vars.FUNCTION_NAME }}
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Python for Function packaging
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
       - name: Login to Azure (prefer OIDC if configured)
         uses: azure/login@v1
         with:
