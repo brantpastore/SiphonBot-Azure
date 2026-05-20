@@ -162,15 +162,24 @@ class SiphonBot:
                 )
                 return
 
+            # Defer immediately to satisfy Discord's 3-second response requirement
+            # before making any network calls (subreddit check, OAuth refresh, etc.)
+            try:
+                await interaction.response.defer(ephemeral=False)
+            except discord.errors.NotFound:
+                logger.warning("Interaction token expired before defer; scrape_custom timed out")
+                return
+            except Exception as e:
+                logger.exception("Failed to defer interaction in scrape_custom_command: %s", e)
+                return
+
             try:
                 subreddit_exists = await check_subreddit_exists(
                     subreddit_name, self.reddit_auth
                 )
             except Exception as e:
                 logger.exception("Error checking subreddit existence: %s", e)
-                await interaction.response.send_message(
-                    f"Error checking subreddit: {e}"
-                )
+                await interaction.followup.send(f"Error checking subreddit: {e}")
                 return
 
             if subreddit_exists:
@@ -180,7 +189,6 @@ class SiphonBot:
                     num_posts = 1
 
                 self.set_cooldown(interaction.user.id)
-                await interaction.response.defer()
                 if self.queue_publisher:
                     await self.queue_publisher.enqueue_scrape_job(
                         subreddit=subreddit_name,
@@ -208,7 +216,7 @@ class SiphonBot:
                         upload_limit=upload_limit,
                     )
             else:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "Invalid subreddit name. Community not found. Please provide a valid subreddit name."
                 )
 
