@@ -97,6 +97,11 @@ jobs:
         env:
           STORAGE_CONN_STR: ${{ env.FUNCTION_STORAGE_CONNECTION_STRING || secrets.FUNCTION_STORAGE_CONNECTION_STRING }}
           SB_CONN_STR: ${{ secrets.SERVICE_BUS_CONNECTION_STRING }}
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          REDDIT_USER_AGENT: ${{ secrets.REDDIT_USER_AGENT }}
+          REDDIT_USERNAME: ${{ secrets.REDDIT_USERNAME }}
+          REDDIT_PASSWORD: ${{ secrets.REDDIT_PASSWORD }}
         run: |
           RG=${{ env.RESOURCE_GROUP }}
           APP=${{ env.FUNCTION_NAME }}
@@ -117,6 +122,11 @@ jobs:
                 SERVICE_BUS_CONNECTION_STRING="$SB_CONN_STR" \
                 FUNCTIONS_EXTENSION_VERSION=~4 \
                 FUNCTIONS_WORKER_RUNTIME=python \
+                REDDIT_CLIENT_ID="$REDDIT_CLIENT_ID" \
+                REDDIT_CLIENT_SECRET="$REDDIT_CLIENT_SECRET" \
+                REDDIT_USER_AGENT="$REDDIT_USER_AGENT" \
+                REDDIT_USERNAME="$REDDIT_USERNAME" \
+                REDDIT_PASSWORD="$REDDIT_PASSWORD" \
                 SERVICE_BUS_QUEUE_NAME=siphon-queue
             echo "✓ Function App settings configured with storage and Service Bus"
           else
@@ -128,6 +138,11 @@ jobs:
                 SERVICE_BUS_CONNECTION_STRING="$SB_CONN_STR" \
                 FUNCTIONS_EXTENSION_VERSION=~4 \
                 FUNCTIONS_WORKER_RUNTIME=python \
+                REDDIT_CLIENT_ID="$REDDIT_CLIENT_ID" \
+                REDDIT_CLIENT_SECRET="$REDDIT_CLIENT_SECRET" \
+                REDDIT_USER_AGENT="$REDDIT_USER_AGENT" \
+                REDDIT_USERNAME="$REDDIT_USERNAME" \
+                REDDIT_PASSWORD="$REDDIT_PASSWORD" \
                 SERVICE_BUS_QUEUE_NAME=siphon-queue
             echo "⚠ Function App settings configured (no storage connection string)"
           fi
