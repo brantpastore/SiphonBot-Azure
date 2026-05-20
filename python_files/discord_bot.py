@@ -57,6 +57,26 @@ class SiphonBot:
         logger.info("Hybrid mode enabled: queueing jobs to Service Bus queue '%s'.", self.service_bus_queue)
         return JobQueuePublisher(self.service_bus_connection, self.service_bus_queue)
 
+    def _resolve_job_webhook_url(self, interaction: discord.Interaction) -> str:
+        """
+        Prefer the interaction follow-up webhook URL for queued responses.
+        Falls back to configured WEBHOOK for compatibility.
+        """
+        try:
+            followup = interaction.followup
+            url = getattr(followup, "url", None)
+            if url:
+                return str(url)
+
+            webhook_id = getattr(followup, "id", None)
+            webhook_token = getattr(followup, "token", None)
+            if webhook_id and webhook_token:
+                return f"https://discord.com/api/webhooks/{webhook_id}/{webhook_token}"
+        except Exception as e:
+            logger.warning("Failed to resolve interaction webhook URL, falling back to configured webhook: %s", e)
+
+        return self.webhook
+
     def check_cooldown(self, user_id: int) -> float:
         """Returns seconds remaining, or 0 if ready."""
         remaining = self.cooldowns.get(user_id, 0) - time.time()
@@ -108,12 +128,13 @@ class SiphonBot:
 
                 self.set_cooldown(interaction.user.id)
                 if self.queue_publisher:
+                    job_webhook_url = self._resolve_job_webhook_url(interaction)
                     await self.queue_publisher.enqueue_scrape_job(
                         subreddit=subreddit_url,
                         filter_type=filter_type,
                         num_posts=num_posts,
                         time_range=time_range,
-                        webhook_url=self.webhook,
+                        webhook_url=job_webhook_url,
                         requested_by=str(interaction.user.id),
                     )
                     await interaction.followup.send(
@@ -190,12 +211,13 @@ class SiphonBot:
 
                 self.set_cooldown(interaction.user.id)
                 if self.queue_publisher:
+                    job_webhook_url = self._resolve_job_webhook_url(interaction)
                     await self.queue_publisher.enqueue_scrape_job(
                         subreddit=subreddit_name,
                         filter_type=filter_type,
                         num_posts=num_posts,
                         time_range=time_range,
-                        webhook_url=self.webhook,
+                        webhook_url=job_webhook_url,
                         requested_by=str(interaction.user.id),
                     )
                     await interaction.followup.send(
