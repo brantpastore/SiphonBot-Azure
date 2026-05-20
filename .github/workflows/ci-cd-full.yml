@@ -157,6 +157,14 @@ jobs:
           mkdir -p function_package
           cp -R azure_functions/. function_package/
           cp -R python_files function_package/python_files
+
+          # Bundle Python dependencies for zip deployment so runtime modules
+          # (e.g., aiohttp) are available without relying on remote build.
+          python -m pip install --upgrade pip
+          mkdir -p function_package/.python_packages/lib/site-packages
+          python -m pip install -r azure_functions/requirements.txt \
+            -t function_package/.python_packages/lib/site-packages
+
           find function_package -name '*.Zone.Identifier' -delete
           (cd function_package && zip -r ../functionapp.zip .)
 
