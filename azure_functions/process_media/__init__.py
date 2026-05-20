@@ -7,7 +7,7 @@ from datetime import datetime
 from shared.media_processor import process_media_job
 
 
-def main(msg: func.ServiceBusQueueMessage) -> None:
+def main(msg: func.ServiceBusMessage) -> None:
     try:
         job = json.loads(msg.get_body().decode("utf-8"))
         job_type = job.get("job_type", "scrape_subreddit")
