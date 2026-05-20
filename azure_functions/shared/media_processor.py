@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from apis.reddit_api import RedditAuth  # type: ignore[reportMissingImports]
 from media.reddit_handler import RedditMediaHandler  # type: ignore[reportMissingImports]
 from media.media_handler import MediaHandler  # type: ignore[reportMissingImports]
+from media.common import safe_followup  # type: ignore[reportMissingImports]
 from shared.webhook_interaction import WebhookInteraction
 
 
@@ -56,7 +57,8 @@ async def process_media_job(job: Dict[str, Any]) -> Dict[str, Any]:
         reddit_handler = RedditMediaHandler(reddit_auth, media_handler)
 
         interaction = WebhookInteraction(webhook_url)
-        await interaction.followup.send(
+        await safe_followup(
+            interaction,
             f"Starting queued scrape for r/{subreddit} ({num_posts} post(s), {filter_type})"
         )
         await reddit_handler.scrape_subreddit(
