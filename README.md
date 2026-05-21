@@ -27,6 +27,28 @@ Discord's upload limit is 50MB (Level 2 boost). When a video exceeds this, Sipho
 - **Compress** - Re-encodes at 480p with a calculated bitrate to fit under the limit. Only offered when the video is short enough for compression to produce a watchable result (≥500kbps video bitrate).
 - **Split into parts** - Splits the video into chunks using stream copy (no quality loss). Each part is labeled with timestamps, e.g. `Video Title (Part 2/4 - 2:30–5:00)`.
 
+## Deployment Architecture
+
+SiphonBot uses a **hybrid serverless + container** architecture on Azure:
+
+```
+Discord ──┐
+          ├─→ Container App (Discord bot) ──→ Service Bus Queue
+          │                            └──→ (inline processing fallback)
+          │
+          └─→ Service Bus Queue ──→ Azure Function App (worker) ──→ Discord Webhook
+```
+
+- **Discord bot** (Azure Container App): Listens for commands, either processes media inline or enqueues to Service Bus
+- **Media worker** (Azure Function App): Dequeues jobs from Service Bus, processes them, posts results via Discord webhook
+- **Queue**: Azure Service Bus for reliable job orchestration and decoupling
+
+### Why Hybrid Mode?
+
+- **Responsiveness**: Discord users get immediate acknowledgment (ephemeral message) without waiting for long downloads
+- **Reliability**: Failed jobs are automatically retried with dead-letter tracking via Service Bus
+- **Scalability**: Worker can scale independently of the Discord bot
+
 ## Setup
 
 ### Environment variables
@@ -46,11 +68,14 @@ SERVICE_BUS_QUEUE_NAME=siphon-queue
 MEDIA_TMP_DIR=/tmp/siphon
 ```
 
-If SERVICE_BUS_CONNECTION_STRING is set, scrape commands run in hybrid mode:
-- The Container App bot enqueues a job to Service Bus.
-- The Azure Function worker processes the job and posts results to Discord via webhook.
+**Queue Mode** (if SERVICE_BUS_CONNECTION_STRING is set):
+- The Container App bot enqueues scrape/media jobs to Service Bus
+- The Azure Function worker dequeues, processes, and posts results via Discord webhook
+- Both bot and worker track delivery failures and dead-letter messages
 
-If SERVICE_BUS_CONNECTION_STRING is not set, the bot falls back to inline processing.
+**Fallback Mode** (if SERVICE_BUS_CONNECTION_STRING is not set):
+- Bot processes all commands inline (no queueing)
+- All responses sent directly to Discord channel or user
 
 For Azure Container Apps deployment, configure secret values in GitHub repository secrets.
 The CI/CD workflow writes these values into the Container App secrets section and maps
