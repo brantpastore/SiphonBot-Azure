@@ -259,9 +259,11 @@ class SiphonBot:
 
             self.set_cooldown(interaction.user.id)
             await interaction.response.defer()
+            await interaction.edit_original_response(content="Fetching Reddit post...")
             upload_limit = interaction.guild.filesize_limit if interaction.guild else None
             logger.info("Guild upload limit: %s bytes", upload_limit)
             await self.reddit.fetch_and_send(interaction, url, upload_limit=upload_limit)
+            await interaction.edit_original_response(content="✅ Done")
 
         @self.tree.command(
             name="download",
@@ -283,6 +285,7 @@ class SiphonBot:
             # Defer immediately to avoid interaction timeout (Discord has 3-second limit)
             try:
                 await interaction.response.defer(ephemeral=False)
+                await interaction.edit_original_response(content="Processing media...")
             except discord.errors.NotFound:
                 logger.warning("Interaction token expired before defer; dl_command timed out")
                 return
@@ -300,6 +303,8 @@ class SiphonBot:
                 await self.reddit.fetch_and_send(interaction, url, upload_limit=upload_limit)
             else:
                 await self.media.download_and_send(interaction, url, upload_limit=upload_limit)
+
+            await interaction.edit_original_response(content="✅ Done")
 
         @scrape_custom_command.autocomplete("filter_type")
         async def filter_type_autocomplete(
