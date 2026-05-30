@@ -364,7 +364,7 @@ class MediaHandler:
                 view.message = msg
                 return
 
-            await send_file(interaction, title, filepath)
+            await send_file(interaction, title, filepath, fallback_url=url)
 
         except Exception as e:
             logger.exception(f"YouTube download error: {e}\n{traceback.format_exc()}")
@@ -505,7 +505,7 @@ class MediaHandler:
                 )
                 return
 
-            await send_file(interaction, title, out_path)
+            await send_file(interaction, title, out_path, fallback_url=url)
 
         except Exception as e:
             logger.exception(f"Compress error: {e}\n{traceback.format_exc()}")
@@ -585,7 +585,7 @@ class MediaHandler:
                 part_title = (
                     f"{title} (Part {idx + 1}/{len(parts)} - {start_ts}-{end_ts})"
                 )
-                await send_file(interaction, part_title, part_path)
+                await send_file(interaction, part_title, part_path, fallback_url=url)
 
         except Exception as e:
             logger.exception(f"Split error: {e}\n{traceback.format_exc()}")

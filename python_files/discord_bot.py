@@ -259,7 +259,6 @@ class SiphonBot:
 
             self.set_cooldown(interaction.user.id)
             await interaction.response.defer()
-            await interaction.followup.send(f"Fetching Reddit post: {url}")
             upload_limit = interaction.guild.filesize_limit if interaction.guild else None
             logger.info("Guild upload limit: %s bytes", upload_limit)
             await self.reddit.fetch_and_send(interaction, url, upload_limit=upload_limit)
@@ -298,10 +297,8 @@ class SiphonBot:
             # route them through the reddit handler instead of yt-dlp.
             # Issue 31: Use proper hostname matching instead of substring search
             if await self.reddit._domain_match(url, ["reddit.com", "redd.it", "v.redd.it"]):
-                await interaction.followup.send(f"Fetching Reddit media: {url}")
                 await self.reddit.fetch_and_send(interaction, url, upload_limit=upload_limit)
             else:
-                await interaction.followup.send(f"Downloading: {url}")
                 await self.media.download_and_send(interaction, url, upload_limit=upload_limit)
 
         @scrape_custom_command.autocomplete("filter_type")

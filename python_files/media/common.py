@@ -58,13 +58,17 @@ async def send_content(interaction, content):
         logger.exception(f"Failed to send content: {e}\n{traceback.format_exc()}")
 
 
-async def send_file(interaction, content, filepath):
+async def send_file(interaction, content, filepath, fallback_url=None):
     if interaction is None:
         return
     try:
         channel = interaction.channel
         if content:
             await channel.send(content=content)
+        
         await channel.send(file=discord.File(filepath))
+
+        if fallback_url:
+            await channel.send(content=f"<{fallback_url}>")
     except Exception as e:
         logger.exception(f"Failed to send file: {e}\n{traceback.format_exc()}")

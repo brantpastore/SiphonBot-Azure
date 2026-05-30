@@ -277,7 +277,7 @@ class RedditMediaHandler:
                         if content_length and int(content_length) > limit:
                             prefix = "NSFW: " if nsfw else ""
                             await send_content(
-                                interaction, f"{prefix}{title}\n{reddit_post_url or image_url}"
+                                interaction, f"{prefix}{title}\n<{reddit_post_url or image_url}>"
                             )
                             return
                         with open(image_filename, "wb") as f:
@@ -292,7 +292,7 @@ class RedditMediaHandler:
                     if content_length and int(content_length) > limit:
                         prefix = "NSFW: " if nsfw else ""
                         await send_content(
-                            interaction, f"{prefix}{title}\n{reddit_post_url or image_url}"
+                            interaction, f"{prefix}{title}\n<{reddit_post_url or image_url}>"
                         )
                         return
                     with open(image_filename, "wb") as f:
@@ -302,17 +302,13 @@ class RedditMediaHandler:
             if os.path.getsize(image_filename) > limit:
                 prefix = "NSFW: " if nsfw else ""
                 await send_content(
-                    interaction, f"{prefix}{title}\n{reddit_post_url or image_url}"
+                    interaction, f"{prefix}{title}\n<{reddit_post_url or image_url}>"
                 )
                 return
 
             prefix = "NSFW: " if nsfw else ""
-            content = (
-                f"{prefix}{title}\n<{reddit_post_url}>"
-                if reddit_post_url
-                else f"{prefix}{title}"
-            )
-            await send_file(interaction, content, image_filename)
+            content = f"{prefix}{title}"
+            await send_file(interaction, content, image_filename, fallback_url=reddit_post_url)
 
         finally:
             cleanup(workdir, image_filename)
@@ -358,7 +354,7 @@ class RedditMediaHandler:
                                 )
                                 prefix = "NSFW: " if nsfw else ""
                                 await send_content(
-                                    interaction, f"{prefix}{title}\n{video_url}"
+                                    interaction, f"{prefix}{title}\n<{video_url}>"
                                 )
                                 return
 
@@ -402,7 +398,7 @@ class RedditMediaHandler:
                             )
                             prefix = "NSFW: " if nsfw else ""
                             await send_content(
-                                interaction, f"{prefix}{title}\n{video_url}"
+                                interaction, f"{prefix}{title}\n<{video_url}>"
                             )
                             return
 
@@ -434,7 +430,7 @@ class RedditMediaHandler:
                     else fallback_url
                 )
                 prefix = "NSFW: " if nsfw else ""
-                await send_content(interaction, f"{prefix}{title}\n{trimmed_url}")
+                await send_content(interaction, f"{prefix}{title}\n<{trimmed_url}>")
                 return
 
             trimmed_backup = (
@@ -444,10 +440,7 @@ class RedditMediaHandler:
             )
             prefix = "NSFW: " if nsfw else ""
             content = f"{prefix}{title}"
-            if trimmed_backup:
-                content += f"\n<{trimmed_backup}>"
-
-            await send_file(interaction, content, video_filename)
+            await send_file(interaction, content, video_filename, fallback_url=trimmed_backup)
 
         except subprocess.TimeoutExpired:
             logger.warning("FFmpeg process timed out.")
@@ -528,7 +521,7 @@ class RedditMediaHandler:
                             logger.info("GIF too large, sending link instead: %s", gif_url)
                             prefix = "NSFW: " if nsfw else ""
                             await send_content(
-                                interaction, f"{prefix}{title}\n{reddit_post_url or gif_url}"
+                                interaction, f"{prefix}{title}\n<{reddit_post_url or gif_url}>"
                             )
                             return
                         with open(gif_filename, "wb") as f:
@@ -544,7 +537,7 @@ class RedditMediaHandler:
                         logger.info("GIF too large, sending link instead: %s", gif_url)
                         prefix = "NSFW: " if nsfw else ""
                         await send_content(
-                            interaction, f"{prefix}{title}\n{reddit_post_url or gif_url}"
+                            interaction, f"{prefix}{title}\n<{reddit_post_url or gif_url}>"
                         )
                         return
                     with open(gif_filename, "wb") as f:
@@ -555,13 +548,13 @@ class RedditMediaHandler:
                 logger.info("GIF too large, sending link instead: %s", gif_url)
                 prefix = "NSFW: " if nsfw else ""
                 await send_content(
-                    interaction, f"{prefix}{title}\n{reddit_post_url or gif_url}"
+                    interaction, f"{prefix}{title}\n<{reddit_post_url or gif_url}>"
                 )
                 return
 
             prefix = "NSFW: " if nsfw else ""
-            content = f"{prefix}{title}\n<{reddit_post_url or gif_url}>"
-            await send_file(interaction, content, gif_filename)
+            content = f"{prefix}{title}"
+            await send_file(interaction, content, gif_filename, fallback_url=reddit_post_url or gif_url)
 
         finally:
             cleanup(workdir, gif_filename)
