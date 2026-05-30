@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "value": "centralus"
+    },
+    "acrName": {
+      "value": "siphonbotacr"
+    },
+    "logWorkspaceName": {
+      "value": "siphonbot-logs"
+    },
+    "appInsightsName": {
+      "value": "siphonbot-insights"
+    },
+    "functionAppName": {
+      "value": "siphonbot-func"
+    },
+    "functionStorageAccountName": {
+      "value": "siphonbotfuncappstorage"
+    },
+    "deployFunctionApp": {
+      "value": false
+    },
+    "functionStorageConnectionString": {
+      "value": ""
+    },
+    "serviceBusName": {
+      "value": "siphonbusopwgwe5r55ke6"
+    },
+    "createUaiAcrPullAssignment": {
+      "value": false
+    },
+    "containerAppPrincipalId": {
+      "value": ""
+    }
+  }
+}

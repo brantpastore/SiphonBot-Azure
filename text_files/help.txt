@@ -1,0 +1,7 @@
+cd C:\Projects\Reddit_Scraper_Bot
+
+docker build -t reddit_scraper_bot .
+
+docker run -d --name reddit_scraper_bot_container reddit_scraper_bot
+
+docker update --restart unless-stopped reddit_scraper_bot_container

@@ -1,0 +1,7 @@
+azure-functions
+aiohttp
+discord.py
+requests
+yt-dlp
+python-dotenv
+azure-servicebus

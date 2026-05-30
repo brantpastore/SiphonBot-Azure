@@ -1,0 +1,19 @@
+apiVersion: "2023-10-01"
+kind: ContainerApp
+properties:
+  name: "<container-app-name>"
+  location: "<location>"
+  configuration:
+    activeRevisionsMode: Single
+  template:
+    containers:
+      - name: siphonbot
+        image: "<ACR_LOGIN_SERVER>/<IMAGE_NAME>:<TAG>"
+        resources:
+          cpu: 1.0
+          memory: "2Gi"
+    scale:
+      minReplicas: 1
+      maxReplicas: 1
+
+# This is a template — prefer deploying via the Bicep template or the CLI.

@@ -1,0 +1,6 @@
+discord.py
+azure-identity
+requests
+aiohttp
+yt-dlp
+azure-servicebus

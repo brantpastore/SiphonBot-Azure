@@ -1,0 +1,9 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: siphon_bot
+    container_name: siphon_bot
+    env_file:
+      - .env
